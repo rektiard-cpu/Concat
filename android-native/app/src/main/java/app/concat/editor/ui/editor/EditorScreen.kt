@@ -329,6 +329,7 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                                 model.select(it)
                                 if (it != null) menu = Menu.Root
                             },
+                            onDrag = { id, p -> model.previewTransform(id, p) },
                             onCommit = { id, p -> model.setTransform(id, p.scale, p.offsetX, p.offsetY, p.rotation) },
                             onEditText = {
                                 model.pause()
@@ -541,7 +542,6 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
             )
 
             if (isLandscape && !fullscreen) {
-                // Tata letak Landscape Split-Screen: Preview + Transport di kiri, Timeline + Toolbar di kanan
                 Row(Modifier.fillMaxSize()) {
                     Column(Modifier.weight(0.44f).fillMaxHeight()) {
                         RenderPreview(Modifier.fillMaxWidth().weight(1f).padding(vertical = 4.dp))
@@ -556,7 +556,6 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                     }
                 }
             } else {
-                // Tata letak Portrait atau Fullscreen
                 val previewHeight: Dp = if (fullscreen) total - Dimens.topBar - Dimens.transport else total * Dimens.PREVIEW_SHARE
                 RenderPreview(Modifier.fillMaxWidth().height(previewHeight).padding(vertical = 6.dp))
                 RenderTransport()
@@ -698,7 +697,6 @@ private fun Transport(
             modifier = Modifier.weight(1f),
         )
 
-        // Tombol Mundur 1 Frame | Play/Pause | Maju 1 Frame
         Row(verticalAlignment = Alignment.CenterVertically) {
             FrameStepButton(forward = false, enabled = duration > 0, onClick = onPrevFrame)
             IconAction(
@@ -713,7 +711,6 @@ private fun Transport(
         }
 
         Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-            // Tombol Penanda Irama / Beat Marker (tap = tambah/hapus di titik ini, tahan = hapus semua)
             Box(
                 Modifier
                     .size(34.dp)
