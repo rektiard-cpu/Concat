@@ -99,13 +99,15 @@ import app.concat.editor.ui.components.ConcatIcon
 import app.concat.editor.ui.components.IconAction
 import app.concat.editor.ui.components.ToolButton
 import app.concat.editor.ui.icons.ConcatIcons
-import app.concat.editor.ui.shortTimecode
 import app.concat.editor.ui.theme.ConcatColors
 import app.concat.editor.ui.theme.ConcatType
 import app.concat.editor.ui.theme.Dimens
 import app.concat.editor.ui.theme.Motion
 import app.concat.editor.ui.theme.Radii
 import app.concat.editor.ui.theme.Spacing
+import java.util.Locale
+import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -213,10 +215,13 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
     val pickSubtitles = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         model.importSubtitles(uri)
     }
-    val exportSrtLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { uri ->
+    val pickFont = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        model.importFont(uri)
+    }
+    val exportSrtLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         model.exportSubtitles(uri, asAss = false)
     }
-    val exportAssLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+    val exportAssLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         model.exportSubtitles(uri, asAss = true)
     }
 
@@ -344,6 +349,7 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                             media = application.concat.media,
                             position = ui.position,
                             selected = ui.selected,
+                            clipRoles = ui.clipRoles,
                             onScrub = model::scrubTo,
                             onSelect = {
                                 model.select(it)
@@ -381,8 +387,13 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                                 Panel.Animation -> selected?.let { AnimationPanel(it, { patch -> model.setLook("Animation", patch) }, close) }
                                 Panel.TextNew -> TextPanel(
                                     existing = null,
+                                    customFonts = ui.customFonts,
+                                    savedColors = ui.savedColors,
                                     eyedropperActive = eyedropperFrame != null,
                                     pickedHex = eyedropperHex,
+                                    onImportFont = { pickFont.launch(arrayOf("*/*")) },
+                                    onSaveColor = model::saveColorSwatch,
+                                    onRemoveColor = model::removeColorSwatch,
                                     onToggleEyedropper = { active ->
                                         if (active) {
                                             model.pause()
@@ -399,8 +410,13 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                                 Panel.TextEdit -> selected?.let { clip ->
                                     TextPanel(
                                         existing = clip,
+                                        customFonts = ui.customFonts,
+                                        savedColors = ui.savedColors,
                                         eyedropperActive = eyedropperFrame != null,
                                         pickedHex = eyedropperHex,
+                                        onImportFont = { pickFont.launch(arrayOf("*/*")) },
+                                        onSaveColor = model::saveColorSwatch,
+                                        onRemoveColor = model::removeColorSwatch,
                                         onToggleEyedropper = { active ->
                                             if (active) {
                                                 model.pause()
@@ -520,6 +536,19 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
     }
 }
 
+private fun preciseTimecode(seconds: Double): String {
+    val totalMs = max(0L, (seconds * 1000.0).roundToInt().toLong())
+    val h = totalMs / 3_600_000L
+    val m = (totalMs % 3_600_000L) / 60_000L
+    val s = (totalMs % 60_000L) / 1000L
+    val ms = totalMs % 1000L
+    return if (h > 0L) {
+        String.format(Locale.US, "%d:%02d:%02d.%03d", h, m, s, ms)
+    } else {
+        String.format(Locale.US, "%02d:%02d.%03d", m, s, ms)
+    }
+}
+
 @Composable
 private fun PanelSlot(visible: Boolean, modifier: Modifier, content: @Composable () -> Unit) {
     AnimatedVisibility(
@@ -593,10 +622,11 @@ private fun Transport(
     ) {
         Text(
             buildAnnotatedString {
-                withStyle(SpanStyle(color = ConcatColors.fg)) { append(shortTimecode(position)) }
-                withStyle(SpanStyle(color = ConcatColors.fgDim)) { append(" / " + shortTimecode(duration)) }
+                withStyle(SpanStyle(color = ConcatColors.fg)) { append(preciseTimecode(position)) }
+                withStyle(SpanStyle(color = ConcatColors.fgDim)) { append(" / " + preciseTimecode(duration)) }
             },
-            style = ConcatType.timecode,
+            style = ConcatType.timecode.copy(fontSize = 11.sp),
+            maxLines = 1,
             modifier = Modifier.weight(1f),
         )
         IconAction(if (playing) ConcatIcons.Pause else ConcatIcons.Play, if (playing) "Pause" else "Play", onPlay, enabled = duration > 0, size = 24.dp, box = 44.dp)
