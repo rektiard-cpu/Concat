@@ -229,6 +229,7 @@ fun Timeline(
     var drag by remember { mutableStateOf<DragPreview?>(null) }
     var fling by remember { mutableStateOf<Job?>(null) }
     var scrollY by remember { mutableStateOf<Float?>(null) }
+    var expandedGroup by remember { mutableStateOf<FeatureGroup?>(null) }
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
     val measurer = rememberTextMeasurer()
@@ -252,6 +253,11 @@ fun Timeline(
         if (selected != null) {
             selection.snapTo(0f)
             selection.animateTo(1f, Motion.tweenShort())
+            val mainId = currentView.tracks.getOrNull(mainTrackIndex(currentView))?.id
+            currentView.clip(selected)?.let { clip ->
+                val grp = featureGroupOf(clip, mainId)
+                expandedGroup = if (grp == FeatureGroup.Main) null else grp
+            }
         }
     }
     val knob = remember { Animatable(0f) }
@@ -310,9 +316,6 @@ fun Timeline(
                     try {
                         val view = currentView
                         val mainTrackId = view.tracks.getOrNull(mainTrackIndex(view))?.id
-                        val expandedGroup = view.clip(currentSelected)
-                            ?.let { featureGroupOf(it, mainTrackId) }
-                            ?.takeIf { it != FeatureGroup.Main }
                         val scale = scaleNow()
                         val playhead = currentPosition
                         val layout = layoutFeatureLanes(view, mainTrackId, expandedGroup, size.height.toFloat(), scrollY, this)
@@ -424,6 +427,7 @@ fun Timeline(
                                     if (hit != null) {
                                         choose(hit.id)
                                     } else {
+                                        expandedGroup = null
                                         choose(null)
                                     }
                                 }
@@ -517,9 +521,6 @@ fun Timeline(
         val scale = if (pxPerSecond <= 0f) 64.dp.toPx() else pxPerSecond
         val centre = size.width / 2f
         val mainTrackId = view.tracks.getOrNull(mainTrackIndex(view))?.id
-        val expandedGroup = view.clip(selected)
-            ?.let { featureGroupOf(it, mainTrackId) }
-            ?.takeIf { it != FeatureGroup.Main }
         val layout = layoutFeatureLanes(view, mainTrackId, expandedGroup, size.height, scrollY, this)
         fun x(seconds: Double) = centre + ((seconds - position) * scale).toFloat()
         val leftVisibleTime = position - (centre + 40.dp.toPx()) / scale
