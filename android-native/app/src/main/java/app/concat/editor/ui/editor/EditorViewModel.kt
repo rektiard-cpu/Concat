@@ -4,6 +4,7 @@
 package app.concat.editor.ui.editor
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -30,6 +31,9 @@ import app.concat.editor.export.ExportPreset
 import app.concat.editor.subtitle.SubtitleCodec
 import java.io.File
 import java.io.IOException
+import java.io.RandomAccessFile
+import java.nio.charset.StandardCharsets
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -45,7 +49,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
+
+data class CustomFont(
+    val family: String,
+    val fileName: String,
+    val path: String,
+)
 
 data class EditorUi(
     val view: ProjectView? = null,
@@ -64,6 +75,12 @@ data class EditorUi(
     val stickers: List<ShapeCard> = emptyList(),
     /** The cover the project names, painted; none while it names none (the timeline shows its first frame). */
     val cover: Bitmap? = null,
+    /** Peran klip teks ("imported", "duplicate") untuk pewarnaan timeline & batch edit. */
+    val clipRoles: Map<String, String> = emptyMap(),
+    /** Daftar font custom (.ttf/.otf) yang diimpor dari penyimpanan HP. */
+    val customFonts: List<CustomFont> = emptyList(),
+    /** Daftar warna hex favorit yang disimpan user secara permanen. */
+    val savedColors: List<String> = emptyList(),
 )
 
 /**
@@ -75,7 +92,14 @@ data class EditorUi(
 class EditorViewModel(application: Application, val path: String) : AndroidViewModel(application) {
     private val app = application.concat
     private val api = app.api
-    private val _ui = MutableStateFlow(EditorUi())
+    private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val _ui = MutableStateFlow(
+        EditorUi(
+            clipRoles = loadClipRoles(),
+            customFonts = scanCustomFonts(),
+            savedColors = loadSavedColors(),
+        ),
+    )
     val ui: StateFlow<EditorUi> = _ui
     val exports get() = app.exports
     val models get() = app.models
@@ -376,14 +400,36 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         change("Split") { apply(Commands.splitClips(listOf(clip.id), _ui.value.position)) }
     }
 
+    /** Menghapus klip; untuk teks/subtitle memakai non-ripple agar timestamp klip lain tidak bergeser. */
     fun delete() {
         val clip = selectedClip() ?: return
+        val ripple = clip.kind != ClipKind.Text
         _ui.update { it.copy(selected = null) }
-        change("Delete") { apply(Commands.removeClips(listOf(clip.id), ripple = true)) }
+        change("Delete") { apply(Commands.removeClips(listOf(clip.id), ripple = ripple)) }
     }
 
+    /** Menduplikasi klip; untuk teks ditempatkan di track atas/bawah pada timestamp yang sama agar tidak menggeser klip sebelah kanan. */
     fun duplicate() {
         val clip = selectedClip() ?: return
+        if (clip.kind == ClipKind.Text) {
+            change("Duplicate") {
+                val baseText = clip.text?.optString("content")?.ifBlank { clip.name } ?: clip.name
+                val clonedStyle = JSONObject(clip.text?.toString() ?: "{}").put("content", baseText)
+                val afterAdd = apply(Commands.addTextClip(clip.start, clonedStyle, duration = clip.duration, trackId = null))
+                val newId = afterAdd.createdId
+                val finalView = if (newId != null && (clip.scale != 1.0 || clip.offsetX != 0.0 || clip.offsetY != 0.0 || clip.rotation != 0.0)) {
+                    apply(Commands.setClipTransform(newId, clip.scale, clip.offsetX, clip.offsetY, clip.rotation))
+                } else {
+                    afterAdd
+                }
+                if (newId != null) {
+                    setClipRoles(mapOf(newId to ROLE_DUPLICATE))
+                    _ui.update { it.copy(selected = newId) }
+                }
+                finalView
+            }
+            return
+        }
         change("Duplicate") {
             val view = apply(Commands.duplicateClips(listOf(clip.id)))
             view.createdId?.let { id -> _ui.update { it.copy(selected = id) } }
@@ -509,13 +555,31 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         change("Flip") { apply(Commands.updateClip(clip.id, JSONObject().put("flipH", !clip.flipH))) }
     }
 
+    /** Memperbarui posisi/skala; jika klip adalah subtitle import, seluruh subtitle import ikut berpindah serentak. */
     fun setTransform(clipId: String, scale: Double, offsetX: Double, offsetY: Double, rotation: Double) {
-        change("Move") { apply(Commands.setClipTransform(clipId, scale, offsetX, offsetY, rotation)) }
+        change("Move") {
+            val roles = _ui.value.clipRoles
+            val isImported = roles[clipId] == ROLE_IMPORTED
+            val targets = if (isImported) {
+                _ui.value.view?.clips
+                    ?.filter { it.kind == ClipKind.Text && roles[it.id] == ROLE_IMPORTED }
+                    ?.map { it.id }
+                    .orEmpty()
+            } else {
+                listOf(clipId)
+            }
+            if (targets.size <= 1) {
+                apply(Commands.setClipTransform(clipId, scale, offsetX, offsetY, rotation))
+            } else {
+                apply(Commands.batch(targets.map { id -> Commands.setClipTransform(id, scale, offsetX, offsetY, rotation) }))
+            }
+        }
     }
 
     fun resetTransform() {
         val clip = selectedClip() ?: return
-        setTransform(clip.id, 1.0, 0.0, 0.0, 0.0)
+        val defaultY = if (_ui.value.clipRoles[clip.id] == ROLE_IMPORTED) SubtitleCodec.DEFAULT_SUBTITLE_OFFSET_Y else 0.0
+        setTransform(clip.id, 1.0, 0.0, defaultY, 0.0)
     }
 
     fun toggleKeyframe() {
@@ -565,20 +629,43 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         select(clip?.id)
     }
 
-    /** A new title at the playhead, or the selected one restyled when [clipId] names it. */
+    /**
+     * Menyimpan teks baru atau memperbarui gaya teks yang dipilih.
+     * Jika klip adalah hasil impor `.SRT`/`.ASS`, seluruh klip impor ikut diperbarui gayanya secara batch.
+     */
     fun saveText(clipId: String?, style: JSONObject) {
         val content = style.optString("content").trim()
         if (content.isEmpty()) return
         val cleanStyle = JSONObject(style.toString()).put("content", content)
-        val existing = _ui.value.view?.clip(clipId)
-        val lane = existing?.let { clip -> _ui.value.view?.tracks?.firstOrNull { it.id == clip.trackId } }
+        val viewNow = _ui.value.view
+        val existing = viewNow?.clip(clipId)
+        val lane = existing?.let { clip -> viewNow.tracks.firstOrNull { it.id == clip.trackId } }
         val captions = lane?.captions
+        val roles = _ui.value.clipRoles
+        val isImported = existing != null && roles[existing.id] == ROLE_IMPORTED
+
         change("Text") {
             if (existing != null && lane != null && captions != null) {
                 val words = Commands.updateClip(existing.id, JSONObject().put("text", cleanStyle))
                 val shared = JSONObject(cleanStyle.toString()).put("content", "")
                 val look = JSONObject(captions.toString()).put("style", shared)
                 apply(Commands.batch(listOf(words, Commands.setCaptionLook(lane.id, look))))
+            } else if (existing != null && isImported && viewNow != null) {
+                val importedClips = viewNow.clips.filter { it.kind == ClipKind.Text && roles[it.id] == ROLE_IMPORTED }
+                val commands = importedClips.map { target ->
+                    val targetContent = if (target.id == existing.id) {
+                        content
+                    } else {
+                        target.text?.optString("content")?.ifBlank { target.name } ?: target.name
+                    }
+                    val targetStyle = JSONObject(cleanStyle.toString()).put("content", targetContent)
+                    Commands.updateClip(target.id, JSONObject().put("text", targetStyle))
+                }
+                val result = apply(if (commands.size == 1) commands[0] else Commands.batch(commands))
+                if (importedClips.size > 1) {
+                    say("Gaya diterapkan ke ${importedClips.size} subtitle impor.")
+                }
+                result
             } else if (existing != null) {
                 apply(Commands.updateClip(existing.id, JSONObject().put("text", cleanStyle)))
             } else {
@@ -586,6 +673,180 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                 view.createdId?.let { id -> _ui.update { it.copy(selected = id) } }
                 view
             }
+        }
+    }
+
+    // -- custom fonts & saved color palette --
+
+    /** Mengimpor file font (.ttf / .otf) dari memori HP ke penyimpanan internal aplikasi. */
+    fun importFont(uri: Uri?) {
+        if (uri == null) return
+        viewModelScope.launch {
+            try {
+                val imported = withContext(Dispatchers.IO) {
+                    val resolver = getApplication<Application>().contentResolver
+                    var rawName = "custom-font-${System.currentTimeMillis()}.ttf"
+                    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                        if (it.moveToFirst()) rawName = it.getString(0) ?: rawName
+                    }
+                    val lower = rawName.lowercase(Locale.ROOT)
+                    if (!lower.endsWith(".ttf") && !lower.endsWith(".otf") && !lower.endsWith(".ttc")) {
+                        throw IOException("Pilih file font berformat .ttf atau .otf.")
+                    }
+                    val fontsDir = File(getApplication<Application>().filesDir, "fonts").apply { mkdirs() }
+                    val safeName = rawName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    val dest = File(fontsDir, safeName)
+                    resolver.openInputStream(uri)?.use { input ->
+                        dest.outputStream().use { output -> input.copyTo(output) }
+                    } ?: throw IOException("Tidak dapat membuka file font.")
+                    val family = extractFontFamilyName(dest)
+                    CustomFont(family = family, fileName = dest.name, path = dest.absolutePath)
+                }
+                _ui.update { it.copy(customFonts = scanCustomFonts()) }
+                say("Font \"${imported.family}\" berhasil ditambahkan.")
+            } catch (error: Exception) {
+                Log.w(TAG, "import font failed", error)
+                say(error.message ?: "Gagal mengimpor font.")
+            }
+        }
+    }
+
+    fun saveColorSwatch(hex: String) {
+        val clean = normalizeHex(hex) ?: return
+        val current = _ui.value.savedColors.toMutableList()
+        if (current.any { it.equals(clean, ignoreCase = true) }) {
+            say("Warna $clean sudah tersimpan.")
+            return
+        }
+        current.add(0, clean)
+        persistSavedColors(current)
+        _ui.update { it.copy(savedColors = current) }
+        say("Warna $clean disimpan.")
+    }
+
+    fun removeColorSwatch(hex: String) {
+        val updated = _ui.value.savedColors.filterNot { it.equals(hex, ignoreCase = true) }
+        persistSavedColors(updated)
+        _ui.update { it.copy(savedColors = updated) }
+    }
+
+    private fun scanCustomFonts(): List<CustomFont> {
+        val dir = File(getApplication<Application>().filesDir, "fonts")
+        if (!dir.exists()) return emptyList()
+        return dir.listFiles()
+            ?.filter { it.isFile && (it.name.endsWith(".ttf", true) || it.name.endsWith(".otf", true) || it.name.endsWith(".ttc", true)) }
+            ?.sortedBy { it.name.lowercase(Locale.ROOT) }
+            ?.map { file -> CustomFont(family = extractFontFamilyName(file), fileName = file.name, path = file.absolutePath) }
+            .orEmpty()
+    }
+
+    private fun extractFontFamilyName(file: File): String {
+        try {
+            RandomAccessFile(file, "r").use { raf ->
+                if (raf.length() < 12) return file.nameWithoutExtension
+                raf.seek(4)
+                val numTables = raf.readUnsignedShort()
+                raf.skipBytes(6)
+                var nameOffset = -1L
+                for (i in 0 until numTables) {
+                    val tagBytes = ByteArray(4)
+                    raf.readFully(tagBytes)
+                    val tag = String(tagBytes, StandardCharsets.US_ASCII)
+                    raf.skipBytes(4)
+                    val offset = raf.readInt().toLong() and 0xFFFFFFFFL
+                    raf.skipBytes(4)
+                    if (tag == "name") {
+                        nameOffset = offset
+                        break
+                    }
+                }
+                if (nameOffset > 0 && nameOffset + 6 < raf.length()) {
+                    raf.seek(nameOffset + 2)
+                    val count = raf.readUnsignedShort()
+                    val stringOffset = raf.readUnsignedShort()
+                    var fallbackFamily: String? = null
+                    for (i in 0 until count) {
+                        val platformId = raf.readUnsignedShort()
+                        val encodingId = raf.readUnsignedShort()
+                        raf.skipBytes(2) // languageId
+                        val nameId = raf.readUnsignedShort()
+                        val length = raf.readUnsignedShort()
+                        val offset = raf.readUnsignedShort()
+                        if (nameId == 1 && length > 0) {
+                            val savedPos = raf.filePointer
+                            val strPos = nameOffset + stringOffset + offset
+                            if (strPos + length <= raf.length()) {
+                                raf.seek(strPos)
+                                val buf = ByteArray(length)
+                                raf.readFully(buf)
+                                val decoded = if (platformId == 3 || platformId == 0 || encodingId == 1) {
+                                    String(buf, StandardCharsets.UTF_16BE).trim()
+                                } else {
+                                    String(buf, StandardCharsets.UTF_8).trim()
+                                }
+                                if (decoded.isNotBlank()) {
+                                    if (platformId == 3) return decoded
+                                    if (fallbackFamily == null) fallbackFamily = decoded
+                                }
+                            }
+                            raf.seek(savedPos)
+                        }
+                    }
+                    if (!fallbackFamily.isNullOrBlank()) return fallbackFamily
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return file.nameWithoutExtension
+    }
+
+    private fun loadSavedColors(): List<String> {
+        val raw = prefs.getString(KEY_SAVED_COLORS, null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).mapNotNull { normalizeHex(arr.optString(it)) }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun persistSavedColors(colors: List<String>) {
+        val arr = JSONArray().apply { colors.forEach { put(it) } }
+        prefs.edit().putString(KEY_SAVED_COLORS, arr.toString()).apply()
+    }
+
+    private fun normalizeHex(raw: String): String? {
+        val clean = raw.trim().removePrefix("#")
+        if (clean.length != 6 && clean.length != 8) return null
+        if (!clean.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return null
+        return "#${clean.lowercase(Locale.ROOT)}"
+    }
+
+    private fun loadClipRoles(): Map<String, String> {
+        val file = File(path, ROLES_FILE)
+        if (!file.exists()) return emptyMap()
+        return try {
+            val json = JSONObject(file.readText())
+            buildMap {
+                for (key in json.keys()) {
+                    val value = json.optString(key)
+                    if (value.isNotEmpty()) put(key, value)
+                }
+            }
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun setClipRoles(entries: Map<String, String>) {
+        if (entries.isEmpty()) return
+        val merged = _ui.value.clipRoles + entries
+        _ui.update { it.copy(clipRoles = merged) }
+        try {
+            val json = JSONObject().apply { merged.forEach { (k, v) -> put(k, v) } }
+            File(path, ROLES_FILE).writeText(json.toString())
+        } catch (error: Exception) {
+            Log.w(TAG, "failed saving clip roles", error)
         }
     }
 
@@ -607,7 +868,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         }
     }
 
-    /** Mengimpor file .srt atau .ass menjadi multi-track text clip tanpa mem-flatten waktu yang overlap. */
+    /** Mengimpor file .srt atau .ass ke posisi bawah-tengah canvas dan menandainya sebagai subtitle impor. */
     fun importSubtitles(uri: Uri?) {
         if (uri == null) return
         val view = _ui.value.view ?: return
@@ -627,10 +888,28 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                 say("Tidak ada baris subtitle yang terbaca.")
                 return@change null
             }
+            val beforeIds = view.clips.filter { it.kind == ClipKind.Text }.map { it.id }.toSet()
             val cmds = SubtitleCodec.buildImportCommands(cues)
-            val updated = apply(Commands.batch(cmds))
-            say("Berhasil impor ${cues.size} baris subtitle.")
-            updated
+            val afterCreate = apply(Commands.batch(cmds))
+            val importedClips = afterCreate.clips.filter { it.kind == ClipKind.Text && it.id !in beforeIds }
+
+            val finalView = if (importedClips.isNotEmpty()) {
+                setClipRoles(importedClips.associate { it.id to ROLE_IMPORTED })
+                val moveBottomCmds = importedClips.map { clip ->
+                    Commands.setClipTransform(
+                        clipId = clip.id,
+                        scale = clip.scale,
+                        offsetX = SubtitleCodec.DEFAULT_SUBTITLE_OFFSET_X,
+                        offsetY = SubtitleCodec.DEFAULT_SUBTITLE_OFFSET_Y,
+                        rotation = clip.rotation,
+                    )
+                }
+                apply(Commands.batch(moveBottomCmds))
+            } else {
+                afterCreate
+            }
+            say("Berhasil impor ${cues.size} baris subtitle di posisi bawah.")
+            finalView
         }
     }
 
@@ -819,6 +1098,11 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
     companion object {
         private const val TAG = "concat-editor"
         private const val MODE = "vulkan"
+        private const val PREFS_NAME = "concat_editor_prefs"
+        private const val KEY_SAVED_COLORS = "saved_colors"
+        const val ROLE_IMPORTED = "imported"
+        const val ROLE_DUPLICATE = "duplicate"
+        const val ROLES_FILE = ".concat-clip-roles.json"
         const val THUMBNAIL = ".concat-thumb.png"
         const val CARD = ".concat-card.json"
         private const val COVER_SIDE = 160
