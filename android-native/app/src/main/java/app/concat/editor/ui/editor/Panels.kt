@@ -40,6 +40,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -236,6 +237,8 @@ fun TextPanel(
         mutableStateOf(style?.optString("plate")?.takeIf { it.startsWith("#") })
     }
 
+    val isDefaultFont = fontPath == null && fontFamily.equals("Hanken Grotesk", ignoreCase = true)
+
     fun buildStyle(): JSONObject = Commands.textStyle(
         content = content.ifEmpty { " " },
         fontSize = size.toDouble(),
@@ -324,11 +327,51 @@ fun TextPanel(
                         }
                     },
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                    ChoiceChip("Regular", selected = weight < 600 && !italic, onClick = { weight = 400.0; italic = false; pushLive() })
-                    ChoiceChip("Bold", selected = weight >= 600 && weight < 800, onClick = { weight = 700.0; pushLive() })
-                    ChoiceChip("Black", selected = weight >= 800, onClick = { weight = 900.0; pushLive() })
-                    ChoiceChip("Italic", selected = italic, onClick = { italic = !italic; pushLive() })
+                Row(
+                    modifier = Modifier.alpha(if (isDefaultFont) 1f else 0.38f),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                ) {
+                    ChoiceChip(
+                        "Regular",
+                        selected = isDefaultFont && weight < 600 && !italic,
+                        onClick = {
+                            if (isDefaultFont) {
+                                weight = 400.0
+                                italic = false
+                                pushLive()
+                            }
+                        },
+                    )
+                    ChoiceChip(
+                        "Bold",
+                        selected = isDefaultFont && weight >= 600 && weight < 800,
+                        onClick = {
+                            if (isDefaultFont) {
+                                weight = 700.0
+                                pushLive()
+                            }
+                        },
+                    )
+                    ChoiceChip(
+                        "Black",
+                        selected = isDefaultFont && weight >= 800,
+                        onClick = {
+                            if (isDefaultFont) {
+                                weight = 900.0
+                                pushLive()
+                            }
+                        },
+                    )
+                    ChoiceChip(
+                        "Italic",
+                        selected = isDefaultFont && italic,
+                        onClick = {
+                            if (isDefaultFont) {
+                                italic = !italic
+                                pushLive()
+                            }
+                        },
+                    )
                 }
                 ValueSlider(
                     "Size",
@@ -353,12 +396,17 @@ fun TextPanel(
                     horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
                 ) {
                     for (builtIn in BUILTIN_FONTS) {
+                        val isDefault = builtIn.equals("Hanken Grotesk", ignoreCase = true)
                         ChoiceChip(
                             builtIn,
                             selected = fontPath == null && fontFamily.equals(builtIn, ignoreCase = true),
                             onClick = {
                                 fontFamily = builtIn
                                 fontPath = null
+                                if (!isDefault) {
+                                    weight = 400.0
+                                    italic = false
+                                }
                                 pushLive()
                             },
                         )
