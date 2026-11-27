@@ -17,9 +17,12 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -64,9 +67,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -106,6 +112,7 @@ import app.concat.editor.ui.theme.Motion
 import app.concat.editor.ui.theme.Radii
 import app.concat.editor.ui.theme.Spacing
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
@@ -247,26 +254,65 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
 
     BoxWithConstraints(Modifier.fillMaxSize().background(ConcatColors.page).safeDrawingPadding()) {
         val total = maxHeight
+        val isLandscape = maxWidth > maxHeight
         val imeVisible = WindowInsets.isImeVisible
-        val previewHeight: Dp = if (fullscreen) total - Dimens.topBar - Dimens.transport else total * Dimens.PREVIEW_SHARE
-        Column(Modifier.fillMaxSize()) {
-            TopBar(
-                name = view?.name ?: "",
-                resolution = view?.let { resolutionLabel(it) } ?: "",
-                canExport = view != null && view.clips.isNotEmpty(),
-                onClose = { model.close(onClosed) },
-                onRename = { renaming = true },
-                onExport = { exporting = true },
-            )
 
-            BoxWithConstraints(
-                Modifier.fillMaxWidth().height(previewHeight).padding(vertical = 6.dp),
-                contentAlignment = Alignment.Center,
-            ) {
+        val fps = view?.fps?.takeIf { it > 0.0 } ?: 30.0
+        val hasMarkerAtPlayhead = ui.markers.any { abs(it - ui.position) <= 0.6 / fps }
+        val keyframeState = selected?.takeIf { it.placeable }?.let { clip ->
+            val at = ((ui.position - clip.start) / clip.duration.coerceAtLeast(1e-6)).coerceIn(0.0, 1.0)
+            clip.keyedAt(at, 0.5 / (fps * clip.duration.coerceAtLeast(1e-6)))
+        }
+
+        val tools = toolsFor(
+            selected = selected,
+            menu = menu,
+            mainTrackId = mainTrackId,
+            panel = panel,
+            actions = ToolActions(
+                openPanel = {
+                    eyedropperFrame = null
+                    eyedropperHex = null
+                    panel = if (panel == it) null else it
+                },
+                setMenu = { menu = it },
+                deselect = {
+                    eyedropperFrame = null
+                    eyedropperHex = null
+                    model.select(null)
+                    panel = null
+                },
+                addMedia = ::addMedia,
+                addOverlay = { pickOverlay.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
+                addAudio = { pickAudio.launch(arrayOf("audio/*")) },
+                importSubs = { pickSubtitles.launch(arrayOf("*/*")) },
+                exportAss = { exportAssLauncher.launch("${view?.name?.ifBlank { "subtitles" } ?: "subtitles"}.ass") },
+                exportSrt = { exportSrtLauncher.launch("${view?.name?.ifBlank { "subtitles" } ?: "subtitles"}.srt") },
+                replace = { sound ->
+                    if (sound) pickReplacementSound.launch(arrayOf("audio/*"))
+                    else pickReplacement.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
+                },
+                reversing = ui.reversing,
+                selectMain = { model.selectAtPlayhead(mainTrackId) },
+                split = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    model.split()
+                },
+                catalogue = { shelf, adjust ->
+                    catalogueAdjust = adjust
+                    catalogueShelf = shelf
+                },
+                model = model,
+            ),
+        )
+
+        @Composable
+        fun RenderPreview(modifier: Modifier) {
+            BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
                 if (view != null) {
                     val aspect = if (view.height > 0) view.width.toFloat() / view.height else 9f / 16f
-                    val roomW = maxWidth - 24.dp
-                    val roomH = maxHeight
+                    val roomW = (maxWidth - 16.dp).coerceAtLeast(48.dp)
+                    val roomH = maxHeight.coerceAtLeast(48.dp)
                     val (w, h) = if (roomW / roomH > aspect) Pair(roomH * aspect, roomH) else Pair(roomW, roomW / aspect)
                     Box(Modifier.size(w, h).background(Color.Black)) {
                         PreviewSurface(model, Modifier.fillMaxSize())
@@ -320,73 +366,115 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                     }
                 }
             }
+        }
 
+        @Composable
+        fun RenderTransport() {
             Transport(
                 position = ui.position,
                 duration = view?.duration ?: 0.0,
                 playing = ui.playing,
                 canUndo = view?.canUndo == true,
                 canRedo = view?.canRedo == true,
-                keyframe = selected?.takeIf { it.placeable }?.let { clip ->
-                    val at = ((ui.position - clip.start) / clip.duration.coerceAtLeast(1e-6)).coerceIn(0.0, 1.0)
-                    clip.keyedAt(at, 0.5 / ((view?.fps ?: 30.0) * clip.duration.coerceAtLeast(1e-6)))
-                },
+                keyframe = keyframeState,
+                hasMarker = hasMarkerAtPlayhead,
+                markerCount = ui.markers.size,
                 fullscreen = fullscreen,
+                compact = isLandscape,
                 onPlay = model::togglePlay,
+                onPrevFrame = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    model.stepFrame(-1)
+                },
+                onNextFrame = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    model.stepFrame(1)
+                },
+                onToggleMarker = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    model.toggleMarker()
+                },
+                onClearMarkers = model::clearMarkers,
                 onUndo = model::undo,
                 onRedo = model::redo,
                 onKeyframe = model::toggleKeyframe,
                 onFullscreen = { fullscreen = !fullscreen },
             )
+        }
 
-            if (!fullscreen) {
-                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f).clipToBounds()) {
-                    val room = maxHeight
-                    if (view != null) {
-                        Timeline(
-                            view = view,
-                            projectPath = path,
-                            media = application.concat.media,
-                            position = ui.position,
-                            selected = ui.selected,
-                            clipRoles = ui.clipRoles,
-                            onScrub = model::scrubTo,
-                            onSelect = {
-                                model.select(it)
-                                if (it != null) menu = Menu.Root
-                            },
-                            onMove = model::move,
-                            onTrim = model::trim,
-                            onAddMedia = ::addMedia,
-                            onTransition = { next ->
-                                model.select(next)
-                                panel = Panel.Transitions
-                            },
-                            onMuteTrack = model::setTrackSoundMuted,
-                            onCover = {
-                                model.select(null)
-                                panel = Panel.Cover
-                            },
-                            cover = coverImage,
-                        )
-                    }
-                    PanelSlot(visible = panel != null, modifier = Modifier.align(Alignment.BottomCenter)) {
-                        Box(Modifier.fillMaxWidth().heightIn(max = room)) {
-                            val close = {
-                                eyedropperFrame = null
-                                eyedropperHex = null
-                                panel = null
-                            }
-                            when (shownPanel) {
-                                Panel.Speed -> selected?.let { SpeedPanel(it, model::setSpeed, close) }
-                                Panel.Volume -> selected?.let { VolumePanel(it, model::setVolume, model::toggleMute, close) }
-                                Panel.Opacity -> selected?.let { OpacityPanel(it, model::setOpacity, close) }
-                                Panel.Fade -> selected?.let { FadePanel(it, model::setFades, close) }
-                                Panel.Crop -> selected?.let { CropPanel(it, { patch -> model.setLook("Crop", patch) }, close) }
-                                Panel.Mask -> selected?.let { MaskPanel(it, { patch -> model.setLook("Mask", patch) }, close) }
-                                Panel.Animation -> selected?.let { AnimationPanel(it, { patch -> model.setLook("Animation", patch) }, close) }
-                                Panel.TextNew -> TextPanel(
-                                    existing = null,
+        @Composable
+        fun RenderTimelineAndPanels(modifier: Modifier) {
+            BoxWithConstraints(modifier.clipToBounds()) {
+                val room = maxHeight
+                if (view != null) {
+                    Timeline(
+                        view = view,
+                        projectPath = path,
+                        media = application.concat.media,
+                        position = ui.position,
+                        selected = ui.selected,
+                        clipRoles = ui.clipRoles,
+                        markers = ui.markers,
+                        onScrub = model::scrubTo,
+                        onSelect = {
+                            model.select(it)
+                            if (it != null) menu = Menu.Root
+                        },
+                        onMove = model::move,
+                        onTrim = model::trim,
+                        onAddMedia = ::addMedia,
+                        onTransition = { next ->
+                            model.select(next)
+                            panel = Panel.Transitions
+                        },
+                        onMuteTrack = model::setTrackSoundMuted,
+                        onCover = {
+                            model.select(null)
+                            panel = Panel.Cover
+                        },
+                        cover = coverImage,
+                    )
+                }
+                PanelSlot(visible = panel != null, modifier = Modifier.align(Alignment.BottomCenter)) {
+                    Box(Modifier.fillMaxWidth().heightIn(max = room)) {
+                        val close = {
+                            eyedropperFrame = null
+                            eyedropperHex = null
+                            panel = null
+                        }
+                        when (shownPanel) {
+                            Panel.Speed -> selected?.let { SpeedPanel(it, model::setSpeed, close) }
+                            Panel.Volume -> selected?.let { VolumePanel(it, model::setVolume, model::toggleMute, close) }
+                            Panel.Opacity -> selected?.let { OpacityPanel(it, model::setOpacity, close) }
+                            Panel.Fade -> selected?.let { FadePanel(it, model::setFades, close) }
+                            Panel.Crop -> selected?.let { CropPanel(it, { patch -> model.setLook("Crop", patch) }, close) }
+                            Panel.Mask -> selected?.let { MaskPanel(it, { patch -> model.setLook("Mask", patch) }, close) }
+                            Panel.Animation -> selected?.let { AnimationPanel(it, { patch -> model.setLook("Animation", patch) }, close) }
+                            Panel.TextNew -> TextPanel(
+                                existing = null,
+                                customFonts = ui.customFonts,
+                                savedColors = ui.savedColors,
+                                eyedropperActive = eyedropperFrame != null,
+                                pickedHex = eyedropperHex,
+                                onImportFont = { pickFont.launch(arrayOf("*/*")) },
+                                onSaveColor = model::saveColorSwatch,
+                                onRemoveColor = model::removeColorSwatch,
+                                onToggleEyedropper = { active ->
+                                    if (active) {
+                                        model.pause()
+                                        scope.launch { eyedropperFrame = model.grabEyedropperFrame() }
+                                    } else {
+                                        eyedropperFrame = null
+                                        eyedropperHex = null
+                                    }
+                                },
+                                onLiveChange = { _ -> },
+                                onSave = { style -> model.saveText(null, style) },
+                                onClose = close,
+                            )
+                            Panel.TextEdit -> selected?.let { clip ->
+                                TextPanel(
+                                    existing = clip,
                                     customFonts = ui.customFonts,
                                     savedColors = ui.savedColors,
                                     eyedropperActive = eyedropperFrame != null,
@@ -403,110 +491,80 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                                             eyedropperHex = null
                                         }
                                     },
-                                    onLiveChange = { _ -> },
-                                    onSave = { style -> model.saveText(null, style) },
+                                    onLiveChange = { style -> model.previewText(clip.id, style) },
+                                    onSave = { style -> model.saveText(clip.id, style) },
                                     onClose = close,
+                                    caption = view?.tracks?.firstOrNull { it.id == clip.trackId }?.captions != null,
                                 )
-                                Panel.TextEdit -> selected?.let { clip ->
-                                    TextPanel(
-                                        existing = clip,
-                                        customFonts = ui.customFonts,
-                                        savedColors = ui.savedColors,
-                                        eyedropperActive = eyedropperFrame != null,
-                                        pickedHex = eyedropperHex,
-                                        onImportFont = { pickFont.launch(arrayOf("*/*")) },
-                                        onSaveColor = model::saveColorSwatch,
-                                        onRemoveColor = model::removeColorSwatch,
-                                        onToggleEyedropper = { active ->
-                                            if (active) {
-                                                model.pause()
-                                                scope.launch { eyedropperFrame = model.grabEyedropperFrame() }
-                                            } else {
-                                                eyedropperFrame = null
-                                                eyedropperHex = null
-                                            }
-                                        },
-                                        onLiveChange = { style -> model.previewText(clip.id, style) },
-                                        onSave = { style -> model.saveText(clip.id, style) },
-                                        onClose = close,
-                                        caption = view?.tracks?.firstOrNull { it.id == clip.trackId }?.captions != null,
-                                    )
-                                }
-                                Panel.Effects -> PackagePanel(Shelf.Effects, catalogue, model, onMore = {
-                                    catalogueAdjust = false
-                                    catalogueShelf = Shelf.Effects
-                                }, onClose = close)
-                                Panel.Filters -> PackagePanel(Shelf.Filters, catalogue, model, onMore = {
-                                    catalogueAdjust = false
-                                    catalogueShelf = Shelf.Filters
-                                }, onClose = close)
-                                Panel.Transitions -> PackagePanel(Shelf.Transitions, catalogue, model, onMore = {
-                                    catalogueAdjust = false
-                                    catalogueShelf = Shelf.Transitions
-                                }, onClose = close)
-                                Panel.Aspect -> view?.let { v -> AspectPanel(v, { model.setAspect(it.width, it.height) }, close) }
-                                Panel.Background -> BackgroundPanel(model::setBackground, close)
-                                Panel.Cover -> CoverPanel(
-                                    ui.cover,
-                                    named = view?.cover != null,
-                                    onFrame = model::setCoverFrame,
-                                    onPicture = { pickCover.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
-                                    onReset = model::resetCover,
-                                    onClose = close,
-                                )
-                                Panel.Stickers -> StickersPanel(ui.stickers, { card -> model.addSticker(card, stickerName(card)) }, close)
-                                Panel.Captions -> CaptionsSheet(captions, model, preferClip = selected?.id, onDismiss = close)
-                                Panel.Speech -> SpeechSheet(speech, model, onDismiss = close)
-                                Panel.Voiceover -> VoiceoverSheet(voiceover, model, onDismiss = close)
-                                null -> Unit
                             }
+                            Panel.Effects -> PackagePanel(Shelf.Effects, catalogue, model, onMore = {
+                                catalogueAdjust = false
+                                catalogueShelf = Shelf.Effects
+                            }, onClose = close)
+                            Panel.Filters -> PackagePanel(Shelf.Filters, catalogue, model, onMore = {
+                                catalogueAdjust = false
+                                catalogueShelf = Shelf.Filters
+                            }, onClose = close)
+                            Panel.Transitions -> PackagePanel(Shelf.Transitions, catalogue, model, onMore = {
+                                catalogueAdjust = false
+                                catalogueShelf = Shelf.Transitions
+                            }, onClose = close)
+                            Panel.Aspect -> view?.let { v -> AspectPanel(v, { model.setAspect(it.width, it.height) }, close) }
+                            Panel.Background -> BackgroundPanel(model::setBackground, close)
+                            Panel.Cover -> CoverPanel(
+                                ui.cover,
+                                named = view?.cover != null,
+                                onFrame = model::setCoverFrame,
+                                onPicture = { pickCover.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                                onReset = model::resetCover,
+                                onClose = close,
+                            )
+                            Panel.Stickers -> StickersPanel(ui.stickers, { card -> model.addSticker(card, stickerName(card)) }, close)
+                            Panel.Captions -> CaptionsSheet(captions, model, preferClip = selected?.id, onDismiss = close)
+                            Panel.Speech -> SpeechSheet(speech, model, onDismiss = close)
+                            Panel.Voiceover -> VoiceoverSheet(voiceover, model, onDismiss = close)
+                            null -> Unit
                         }
                     }
                 }
+            }
+        }
 
-                if (!imeVisible) {
-                    val tools = toolsFor(
-                        selected = selected,
-                        menu = menu,
-                        mainTrackId = mainTrackId,
-                        panel = panel,
-                        actions = ToolActions(
-                            openPanel = {
-                                eyedropperFrame = null
-                                eyedropperHex = null
-                                panel = if (panel == it) null else it
-                            },
-                            setMenu = { menu = it },
-                            deselect = {
-                                eyedropperFrame = null
-                                eyedropperHex = null
-                                model.select(null)
-                                panel = null
-                            },
-                            addMedia = ::addMedia,
-                            addOverlay = { pickOverlay.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) },
-                            addAudio = { pickAudio.launch(arrayOf("audio/*")) },
-                            importSubs = { pickSubtitles.launch(arrayOf("*/*")) },
-                            exportAss = { exportAssLauncher.launch("${view?.name?.ifBlank { "subtitles" } ?: "subtitles"}.ass") },
-                            exportSrt = { exportSrtLauncher.launch("${view?.name?.ifBlank { "subtitles" } ?: "subtitles"}.srt") },
-                            replace = { sound ->
-                                if (sound) pickReplacementSound.launch(arrayOf("audio/*"))
-                                else pickReplacement.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
-                            },
-                            reversing = ui.reversing,
-                            selectMain = { model.selectAtPlayhead(mainTrackId) },
-                            split = {
-                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                model.split()
-                            },
-                            catalogue = { shelf, adjust ->
-                                catalogueAdjust = adjust
-                                catalogueShelf = shelf
-                            },
-                            model = model,
-                        ),
-                    )
-                    Toolbar(tools, key = "${selected?.kind}-${selected != null}-$menu")
+        Column(Modifier.fillMaxSize()) {
+            TopBar(
+                name = view?.name ?: "",
+                resolution = view?.let { resolutionLabel(it) } ?: "",
+                canExport = view != null && view.clips.isNotEmpty(),
+                onClose = { model.close(onClosed) },
+                onRename = { renaming = true },
+                onExport = { exporting = true },
+            )
+
+            if (isLandscape && !fullscreen) {
+                // Tata letak Landscape Split-Screen: Preview + Transport di kiri, Timeline + Toolbar di kanan
+                Row(Modifier.fillMaxSize()) {
+                    Column(Modifier.weight(0.44f).fillMaxHeight()) {
+                        RenderPreview(Modifier.fillMaxWidth().weight(1f).padding(vertical = 4.dp))
+                        RenderTransport()
+                    }
+                    Box(Modifier.width(1.dp).fillMaxHeight().background(ConcatColors.line))
+                    Column(Modifier.weight(0.56f).fillMaxHeight()) {
+                        RenderTimelineAndPanels(Modifier.fillMaxWidth().weight(1f))
+                        if (!imeVisible) {
+                            Toolbar(tools, key = "${selected?.kind}-${selected != null}-$menu")
+                        }
+                    }
+                }
+            } else {
+                // Tata letak Portrait atau Fullscreen
+                val previewHeight: Dp = if (fullscreen) total - Dimens.topBar - Dimens.transport else total * Dimens.PREVIEW_SHARE
+                RenderPreview(Modifier.fillMaxWidth().height(previewHeight).padding(vertical = 6.dp))
+                RenderTransport()
+                if (!fullscreen) {
+                    RenderTimelineAndPanels(Modifier.fillMaxWidth().weight(1f))
+                    if (!imeVisible) {
+                        Toolbar(tools, key = "${selected?.kind}-${selected != null}-$menu")
+                    }
                 }
             }
         }
@@ -517,7 +575,7 @@ fun EditorScreen(path: String, session: Int, onClosed: () -> Unit, startTool: St
                 model.dismissMessage()
             }
             Box(
-                Modifier.align(Alignment.TopCenter).padding(top = Dimens.topBar + previewHeight - 52.dp).padding(horizontal = Spacing.xl)
+                Modifier.align(Alignment.TopCenter).padding(top = Dimens.topBar + 12.dp).padding(horizontal = Spacing.xl)
                     .clip(RoundedCornerShape(Radii.lg)).background(ConcatColors.raised).clickable { model.dismissMessage() }
                     .padding(horizontal = Spacing.lg, vertical = 10.dp),
             ) { Text(message, style = ConcatType.label, color = ConcatColors.fg, textAlign = TextAlign.Center) }
@@ -601,6 +659,7 @@ private fun TopBar(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Transport(
     position: Double,
@@ -609,42 +668,141 @@ private fun Transport(
     canUndo: Boolean,
     canRedo: Boolean,
     keyframe: Boolean?,
+    hasMarker: Boolean,
+    markerCount: Int,
     fullscreen: Boolean,
+    compact: Boolean,
     onPlay: () -> Unit,
+    onPrevFrame: () -> Unit,
+    onNextFrame: () -> Unit,
+    onToggleMarker: () -> Unit,
+    onClearMarkers: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onKeyframe: () -> Unit,
     onFullscreen: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().height(Dimens.transport).padding(horizontal = Spacing.md),
+        Modifier.fillMaxWidth().height(Dimens.transport).padding(horizontal = if (compact) Spacing.sm else Spacing.md),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             buildAnnotatedString {
                 withStyle(SpanStyle(color = ConcatColors.fg)) { append(preciseTimecode(position)) }
-                withStyle(SpanStyle(color = ConcatColors.fgDim)) { append(" / " + preciseTimecode(duration)) }
+                if (!compact) {
+                    withStyle(SpanStyle(color = ConcatColors.fgDim)) { append(" / " + preciseTimecode(duration)) }
+                }
             },
-            style = ConcatType.timecode.copy(fontSize = 11.sp),
+            style = ConcatType.timecode.copy(fontSize = if (compact) 10.sp else 11.sp),
             maxLines = 1,
             modifier = Modifier.weight(1f),
         )
-        IconAction(if (playing) ConcatIcons.Pause else ConcatIcons.Play, if (playing) "Pause" else "Play", onPlay, enabled = duration > 0, size = 24.dp, box = 44.dp)
+
+        // Tombol Mundur 1 Frame | Play/Pause | Maju 1 Frame
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            FrameStepButton(forward = false, enabled = duration > 0, onClick = onPrevFrame)
+            IconAction(
+                if (playing) ConcatIcons.Pause else ConcatIcons.Play,
+                if (playing) "Pause" else "Play",
+                onPlay,
+                enabled = duration > 0,
+                size = 22.dp,
+                box = 38.dp,
+            )
+            FrameStepButton(forward = true, enabled = duration > 0, onClick = onNextFrame)
+        }
+
         Row(Modifier.weight(1f), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+            // Tombol Penanda Irama / Beat Marker (tap = tambah/hapus di titik ini, tahan = hapus semua)
+            Box(
+                Modifier
+                    .size(34.dp)
+                    .clip(CircleShape)
+                    .combinedClickable(
+                        enabled = duration > 0,
+                        onClick = onToggleMarker,
+                        onLongClick = { if (markerCount > 0) onClearMarkers() },
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                val markerTint = when {
+                    hasMarker -> Color(0xFF38BDF8)
+                    markerCount > 0 -> ConcatColors.fg
+                    else -> ConcatColors.fgMuted
+                }
+                Canvas(Modifier.size(16.dp)) {
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val r = 6.dp.toPx()
+                    val diamond = Path().apply {
+                        moveTo(cx, cy - r)
+                        lineTo(cx + r, cy)
+                        lineTo(cx, cy + r)
+                        lineTo(cx - r, cy)
+                        close()
+                    }
+                    if (hasMarker) {
+                        drawPath(diamond, markerTint)
+                    } else {
+                        drawPath(diamond, markerTint, style = Stroke(width = 1.6.dp.toPx()))
+                    }
+                }
+            }
+
             if (keyframe != null) {
                 IconAction(
                     if (keyframe) ConcatIcons.KeyframeFilled else ConcatIcons.Keyframe,
                     "Keyframe",
                     onKeyframe,
                     tint = if (keyframe) ConcatColors.accent else ConcatColors.fg,
-                    size = 18.dp,
-                    box = 36.dp,
+                    size = 17.dp,
+                    box = 32.dp,
                 )
             }
-            IconAction(ConcatIcons.Undo, "Undo", onUndo, enabled = canUndo, size = 20.dp, box = 36.dp)
-            IconAction(ConcatIcons.Redo, "Redo", onRedo, enabled = canRedo, size = 20.dp, box = 36.dp)
-            IconAction(ConcatIcons.Maximize, if (fullscreen) "Leave full screen" else "Full screen", onFullscreen, size = 18.dp, box = 36.dp,
-                tint = if (fullscreen) ConcatColors.accent else ConcatColors.fg)
+            IconAction(ConcatIcons.Undo, "Undo", onUndo, enabled = canUndo, size = 18.dp, box = 32.dp)
+            IconAction(ConcatIcons.Redo, "Redo", onRedo, enabled = canRedo, size = 18.dp, box = 32.dp)
+            IconAction(
+                ConcatIcons.Maximize,
+                if (fullscreen) "Leave full screen" else "Full screen",
+                onFullscreen,
+                size = 17.dp,
+                box = 32.dp,
+                tint = if (fullscreen) ConcatColors.accent else ConcatColors.fg,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FrameStepButton(forward: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val tint = if (enabled) ConcatColors.fg else ConcatColors.fgDim
+    Box(
+        Modifier
+            .size(32.dp)
+            .clip(CircleShape)
+            .clickable(enabled = enabled, onClickLabel = if (forward) "Next frame" else "Previous frame", onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.size(14.dp)) {
+            val w = size.width
+            val h = size.height
+            val barW = 1.8.dp.toPx()
+            val tri = Path()
+            if (forward) {
+                tri.moveTo(2.dp.toPx(), 2.dp.toPx())
+                tri.lineTo(w - barW - 3.dp.toPx(), h / 2f)
+                tri.lineTo(2.dp.toPx(), h - 2.dp.toPx())
+                tri.close()
+                drawPath(tri, tint)
+                drawLine(tint, Offset(w - barW, 2.dp.toPx()), Offset(w - barW, h - 2.dp.toPx()), strokeWidth = barW)
+            } else {
+                tri.moveTo(w - 2.dp.toPx(), 2.dp.toPx())
+                tri.lineTo(barW + 3.dp.toPx(), h / 2f)
+                tri.lineTo(w - 2.dp.toPx(), h - 2.dp.toPx())
+                tri.close()
+                drawPath(tri, tint)
+                drawLine(tint, Offset(barW, 2.dp.toPx()), Offset(barW, h - 2.dp.toPx()), strokeWidth = barW)
+            }
         }
     }
 }
