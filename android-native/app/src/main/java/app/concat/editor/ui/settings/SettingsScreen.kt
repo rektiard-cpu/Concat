@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +28,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -48,6 +51,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.concat.editor.BuildConfig
+import app.concat.editor.MainActivity
 import app.concat.editor.api.ModelInfo
 import app.concat.editor.api.VersionInfo
 import app.concat.editor.concat
@@ -62,10 +66,19 @@ import kotlinx.coroutines.launch
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application.concat
+    private val prefs = application.getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
     val models = app.models
     val fake get() = app.api.engine.isFake
     private val _version = MutableStateFlow<VersionInfo?>(null)
     val version: StateFlow<VersionInfo?> = _version
+
+    private val _autoLandscape = MutableStateFlow(prefs.getBoolean(MainActivity.KEY_AUTO_LANDSCAPE, true))
+    val autoLandscape: StateFlow<Boolean> = _autoLandscape
+
+    fun setAutoLandscape(enabled: Boolean) {
+        prefs.edit().putBoolean(MainActivity.KEY_AUTO_LANDSCAPE, enabled).apply()
+        _autoLandscape.value = enabled
+    }
 
     fun load() {
         models.refresh()
@@ -80,14 +93,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 }
 
 /**
- * Settings: the speech models (download, delete) and what this build is.
- * There is no log to share: the API offers none, so the engine's lines go
- * to logcat only.
+ * Settings: display orientation toggle, speech models (download, delete) and build info.
  */
 @Composable
 fun SettingsScreen(onBack: () -> Unit, model: SettingsViewModel = viewModel()) {
     val models by model.models.state.collectAsStateWithLifecycle()
     val version by model.version.collectAsStateWithLifecycle()
+    val autoLandscape by model.autoLandscape.collectAsStateWithLifecycle()
     var deleting by remember { mutableStateOf<ModelInfo?>(null) }
     LaunchedEffect(Unit) { model.load() }
     BackHandler(onBack = onBack)
@@ -103,6 +115,35 @@ fun SettingsScreen(onBack: () -> Unit, model: SettingsViewModel = viewModel()) {
             Modifier.fillMaxSize().padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            item { Heading("Display") }
+            item {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Palette.surface)
+                        .clickable { model.setAutoLandscape(!autoLandscape) }
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text("Auto-rotate (Landscape & Portrait)", color = Palette.text, fontWeight = FontWeight.Medium)
+                        Text(
+                            if (autoLandscape) "Aktif — tampilan otomatis mengikuti orientasi HP" else "Nonaktif — layar terkunci di mode Portrait",
+                            color = Palette.muted,
+                            fontSize = 12.sp,
+                        )
+                    }
+                    Switch(
+                        checked = autoLandscape,
+                        onCheckedChange = { model.setAutoLandscape(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.background,
+                            checkedTrackColor = Palette.accent,
+                        ),
+                    )
+                }
+            }
             item { Heading("Captions models") }
             items(models.info.transcribers, key = { "t-${it.id}" }) { info ->
                 ModelRow(info, models.downloads[info.id]?.fraction, onDownload = { model.models.download(info) }, onDelete = { deleting = info })
@@ -208,8 +249,6 @@ private fun shareLatestLog(context: Context): Boolean {
         .putExtra(Intent.EXTRA_STREAM, uri)
         .putExtra(Intent.EXTRA_SUBJECT, "Concat log ${newest.name}")
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    // The chooser reads the file too, for its preview; the grant reaches
-    // it through the clip.
     send.clipData = ClipData.newRawUri(newest.name, uri)
     context.startActivity(Intent.createChooser(send, "Share the log").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     return true
