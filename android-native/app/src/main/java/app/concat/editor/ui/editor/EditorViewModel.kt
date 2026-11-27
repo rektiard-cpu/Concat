@@ -34,6 +34,7 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -81,6 +82,8 @@ data class EditorUi(
     val customFonts: List<CustomFont> = emptyList(),
     /** Daftar warna hex favorit yang disimpan user secara permanen. */
     val savedColors: List<String> = emptyList(),
+    /** Penanda titik irama / beat markers (dalam detik) untuk snap timestamp subtitle. */
+    val markers: List<Double> = emptyList(),
 )
 
 /**
@@ -98,6 +101,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
             clipRoles = loadClipRoles(),
             customFonts = scanCustomFonts(),
             savedColors = loadSavedColors(),
+            markers = loadMarkers(),
         ),
     )
     val ui: StateFlow<EditorUi> = _ui
@@ -174,13 +178,16 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         viewModelScope.launch {
             while (true) {
                 val shown = preview
-                if (shown != null && SystemClock.uptimeMillis() - scrubbedAt > 300) {
+                if (shown != null && SystemClock.uptimeMillis() - scrubbedAt > 250) {
                     val (at, playing, slower) = withContext(Dispatchers.IO) {
                         Triple(shown.position(), shown.isPlaying(), shown.slower())
                     }
-                    _ui.update { it.copy(position = at, playing = playing, previewSlower = slower) }
+                    val current = _ui.value
+                    if (abs(current.position - at) > 1e-4 || current.playing != playing || current.previewSlower != slower) {
+                        _ui.update { it.copy(position = at, playing = playing, previewSlower = slower) }
+                    }
                 }
-                delay(if (_ui.value.playing) 33 else 250)
+                delay(if (_ui.value.playing) 24 else 250)
             }
         }
     }
@@ -197,7 +204,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         preview?.detachSurface()
     }
 
-    // -- transport --
+    // -- transport & frame stepping --
 
     fun togglePlay() {
         val shown = preview ?: return
@@ -223,6 +230,60 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         if (_ui.value.playing) pause()
         _ui.update { it.copy(position = at) }
         seeks.trySend(at)
+    }
+
+    /** Maju atau mundur tepat 1 frame sesuai FPS proyek (mis. 1/30s = 33.3ms). */
+    fun stepFrame(deltaFrames: Int) {
+        val view = _ui.value.view ?: return
+        val fps = view.fps.takeIf { it > 0.0 } ?: 30.0
+        val step = deltaFrames.toDouble() / fps
+        scrubTo((_ui.value.position + step).coerceIn(0.0, view.duration))
+    }
+
+    // -- beat / irama markers --
+
+    /** Menambah atau menghapus penanda irama pada posisi playhead aktif. */
+    fun toggleMarker() {
+        val view = _ui.value.view ?: return
+        val fps = view.fps.takeIf { it > 0.0 } ?: 30.0
+        val tolerance = 0.6 / fps
+        val at = _ui.value.position.coerceIn(0.0, view.duration)
+        val existing = _ui.value.markers.toMutableList()
+        val nearIdx = existing.indexOfFirst { abs(it - at) <= tolerance }
+        if (nearIdx >= 0) {
+            existing.removeAt(nearIdx)
+        } else {
+            existing.add(at)
+            existing.sort()
+        }
+        persistMarkers(existing)
+        _ui.update { it.copy(markers = existing) }
+    }
+
+    fun clearMarkers() {
+        persistMarkers(emptyList())
+        _ui.update { it.copy(markers = emptyList()) }
+        say("Semua penanda irama dihapus.")
+    }
+
+    private fun loadMarkers(): List<Double> {
+        val file = File(path, MARKERS_FILE)
+        if (!file.exists()) return emptyList()
+        return try {
+            val arr = JSONArray(file.readText())
+            (0 until arr.length()).map { arr.optDouble(it) }.filter { !it.isNaN() && it >= 0.0 }.sorted()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun persistMarkers(list: List<Double>) {
+        try {
+            val arr = JSONArray().apply { list.forEach { put(it) } }
+            File(path, MARKERS_FILE).writeText(arr.toString())
+        } catch (error: Exception) {
+            Log.w(TAG, "failed saving markers", error)
+        }
     }
 
     fun select(clipId: String?) = _ui.update { it.copy(selected = clipId) }
@@ -359,7 +420,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         }
     }
 
-    /** Memperbarui gaya & teks klip secara real-time saat mengetik atau menggeser slider/eyedropper. */
     fun previewText(clipId: String, style: JSONObject) {
         liveText.trySend(clipId to style)
     }
@@ -400,7 +460,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         change("Split") { apply(Commands.splitClips(listOf(clip.id), _ui.value.position)) }
     }
 
-    /** Menghapus klip; untuk teks/subtitle memakai non-ripple agar timestamp klip lain tidak bergeser. */
     fun delete() {
         val clip = selectedClip() ?: return
         val ripple = clip.kind != ClipKind.Text
@@ -408,7 +467,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         change("Delete") { apply(Commands.removeClips(listOf(clip.id), ripple = ripple)) }
     }
 
-    /** Menduplikasi klip; untuk teks ditempatkan di track atas/bawah pada timestamp yang sama agar tidak menggeser klip sebelah kanan. */
     fun duplicate() {
         val clip = selectedClip() ?: return
         if (clip.kind == ClipKind.Text) {
@@ -444,7 +502,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         if (at <= clip.start + edge || at >= clip.end - edge) return say("Move the playhead inside the clip to freeze it.")
         change("Freeze") {
             val view = api.clipsFreeze(path, clip.id, at)
-            view.clips.firstOrNull { it.trackId == clip.trackId && kotlin.math.abs(it.start - at) < 1e-6 }
+            view.clips.firstOrNull { it.trackId == clip.trackId && abs(it.start - at) < 1e-6 }
                 ?.let { hold -> _ui.update { it.copy(selected = hold.id) } }
             view
         }
@@ -555,7 +613,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         change("Flip") { apply(Commands.updateClip(clip.id, JSONObject().put("flipH", !clip.flipH))) }
     }
 
-    /** Memperbarui posisi/skala; jika klip adalah subtitle import, seluruh subtitle import ikut berpindah serentak. */
     fun setTransform(clipId: String, scale: Double, offsetX: Double, offsetY: Double, rotation: Double) {
         change("Move") {
             val roles = _ui.value.clipRoles
@@ -593,7 +650,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         )
         if (clip.keyedAt(at, tolerance)) {
             val commands = clip.keys.flatMap { (property, ats) ->
-                ats.filter { kotlin.math.abs(it - at) <= tolerance }.map { Commands.clearClipKey(clip.id, property, it) }
+                ats.filter { abs(it - at) <= tolerance }.map { Commands.clearClipKey(clip.id, property, it) }
             }
             change("Keyframe") { apply(Commands.batch(commands)) }
         } else {
@@ -625,14 +682,10 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         val view = _ui.value.view ?: return
         val at = _ui.value.position
         val clip = view.clips.firstOrNull { (trackId == null || it.trackId == trackId) && at >= it.start && at < it.end }
-            ?: view.clips.filter { trackId == null || it.trackId == trackId }.minByOrNull { kotlin.math.abs(it.start - at) }
+            ?: view.clips.filter { trackId == null || it.trackId == trackId }.minByOrNull { abs(it.start - at) }
         select(clip?.id)
     }
 
-    /**
-     * Menyimpan teks baru atau memperbarui gaya teks yang dipilih.
-     * Jika klip adalah hasil impor `.SRT`/`.ASS`, seluruh klip impor ikut diperbarui gayanya secara batch.
-     */
     fun saveText(clipId: String?, style: JSONObject) {
         val content = style.optString("content").trim()
         if (content.isEmpty()) return
@@ -678,7 +731,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
 
     // -- custom fonts & saved color palette --
 
-    /** Mengimpor file font (.ttf / .otf) dari memori HP ke penyimpanan internal aplikasi. */
     fun importFont(uri: Uri?) {
         if (uri == null) return
         viewModelScope.launch {
@@ -768,7 +820,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                     for (i in 0 until count) {
                         val platformId = raf.readUnsignedShort()
                         val encodingId = raf.readUnsignedShort()
-                        raf.skipBytes(2) // languageId
+                        raf.skipBytes(2)
                         val nameId = raf.readUnsignedShort()
                         val length = raf.readUnsignedShort()
                         val offset = raf.readUnsignedShort()
@@ -852,7 +904,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
 
     // -- eyedropper & subtitles --
 
-    /** Mengambil frame komposit pada waktu aktif sebagai Bitmap untuk Eyedropper. */
     suspend fun grabEyedropperFrame(): Bitmap? = withContext(Dispatchers.IO) {
         val view = _ui.value.view ?: return@withContext null
         val tall = view.height >= view.width
@@ -868,7 +919,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         }
     }
 
-    /** Mengimpor file .srt atau .ass ke posisi bawah-tengah canvas dan menandainya sebagai subtitle impor. */
     fun importSubtitles(uri: Uri?) {
         if (uri == null) return
         val view = _ui.value.view ?: return
@@ -913,7 +963,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         }
     }
 
-    /** Mengekspor semua track teks/subtitle ke file .srt atau .ass yang dipilih user. */
     fun exportSubtitles(uri: Uri?, asAss: Boolean) {
         if (uri == null) return
         val view = _ui.value.view ?: return
@@ -1103,6 +1152,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         const val ROLE_IMPORTED = "imported"
         const val ROLE_DUPLICATE = "duplicate"
         const val ROLES_FILE = ".concat-clip-roles.json"
+        const val MARKERS_FILE = ".concat-markers.json"
         const val THUMBNAIL = ".concat-thumb.png"
         const val CARD = ".concat-card.json"
         private const val COVER_SIDE = 160
