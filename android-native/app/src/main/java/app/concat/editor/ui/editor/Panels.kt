@@ -3,15 +3,21 @@
 
 package app.concat.editor.ui.editor
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -37,9 +43,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -62,6 +72,7 @@ import app.concat.editor.ui.theme.ConcatColors
 import app.concat.editor.ui.theme.ConcatType
 import app.concat.editor.ui.theme.Radii
 import app.concat.editor.ui.theme.Spacing
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.pow
@@ -142,7 +153,12 @@ fun FadePanel(clip: Clip, onApply: (Double, Double) -> Unit, onClose: () -> Unit
     }
 }
 
-val TEXT_COLOURS = listOf("#ffffff", "#000000", "#cbf53f", "#ffd60a", "#ff9f0a", "#ff375f", "#bf5af2", "#0a84ff", "#30d158")
+val TEXT_COLOURS = listOf(
+    "#ffffff", "#000000", "#f4dad4", "#dd8c96", "#2e4060",
+    "#cbf53f", "#ffd60a", "#ff9f0a", "#ff375f", "#bf5af2", "#0a84ff", "#30d158",
+)
+
+private val BUILTIN_FONTS = listOf("Hanken Grotesk", "sans-serif", "serif", "monospace")
 
 fun colourOf(hex: String): Color = try {
     Color(android.graphics.Color.parseColor(hex))
@@ -150,18 +166,41 @@ fun colourOf(hex: String): Color = try {
     Color.White
 }
 
-private enum class TextTab { Text, Fill, Outline, Box }
+private fun hexFromColor(color: Color): String {
+    val argb = color.toArgb()
+    return String.format(Locale.US, "#%06x", argb and 0xFFFFFF)
+}
+
+private fun hsvOfHex(hex: String): FloatArray {
+    val hsv = FloatArray(3)
+    try {
+        android.graphics.Color.colorToHSV(android.graphics.Color.parseColor(hex), hsv)
+    } catch (_: Exception) {
+        hsv[0] = 0f
+        hsv[1] = 0f
+        hsv[2] = 1f
+    }
+    return hsv
+}
+
+private enum class TextTab { Text, Font, Fill, Outline, Box }
 private enum class ColorTarget { Fill, Outline, Box }
 
 /**
- * Panel editor teks real-time: mendukung gaya huruf, warna, outline/stroke,
- * drop shadow, background plate, dan Eyedropper langsung dari frame video.
+ * Panel editor teks real-time: mendukung gaya huruf, impor custom font (.ttf/.otf),
+ * color palette spektrum penuh + save swatches, outline/stroke, drop shadow,
+ * background plate, dan Eyedropper langsung dari frame video.
  */
 @Composable
 fun TextPanel(
     existing: Clip?,
+    customFonts: List<CustomFont>,
+    savedColors: List<String>,
     eyedropperActive: Boolean,
     pickedHex: String?,
+    onImportFont: () -> Unit,
+    onSaveColor: (String) -> Unit,
+    onRemoveColor: (String) -> Unit,
     onToggleEyedropper: (Boolean) -> Unit,
     onLiveChange: (JSONObject) -> Unit,
     onSave: (JSONObject) -> Unit,
@@ -174,6 +213,7 @@ fun TextPanel(
 
     var content by remember(existing?.id) { mutableStateOf(style?.optString("content") ?: "") }
     var size by remember(existing?.id) { mutableFloatStateOf((style?.optDouble("fontSize", 0.07) ?: 0.07).toFloat()) }
+    var fontFamily by remember(existing?.id) { mutableStateOf(style?.optString("fontFamily", "Hanken Grotesk")?.ifBlank { "Hanken Grotesk" } ?: "Hanken Grotesk") }
     var colour by remember(existing?.id) { mutableStateOf(style?.optString("color", "#ffffff") ?: "#ffffff") }
     var weight by remember(existing?.id) { mutableStateOf(style?.optDouble("fontWeight", 700.0) ?: 700.0) }
     var italic by remember(existing?.id) { mutableStateOf(style?.optBoolean("italic", false) ?: false) }
@@ -197,6 +237,7 @@ fun TextPanel(
         shadow = shadow,
         plate = plateColour,
         clearPlate = plateColour == null,
+        fontFamily = fontFamily,
     )
 
     fun pushLive() {
@@ -236,8 +277,12 @@ fun TextPanel(
         },
         onConfirm = ::save,
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+        ) {
             ChoiceChip("Text", selected = tab == TextTab.Text, onClick = { tab = TextTab.Text; onToggleEyedropper(false) })
+            ChoiceChip("Font", selected = tab == TextTab.Font, onClick = { tab = TextTab.Font; onToggleEyedropper(false) })
             ChoiceChip("Color", selected = tab == TextTab.Fill, onClick = { tab = TextTab.Fill; colorTarget = ColorTarget.Fill })
             ChoiceChip("Outline", selected = tab == TextTab.Outline, onClick = { tab = TextTab.Outline; colorTarget = ColorTarget.Outline })
             ChoiceChip("Box & Shadow", selected = tab == TextTab.Box, onClick = { tab = TextTab.Box; colorTarget = ColorTarget.Box })
@@ -282,14 +327,56 @@ fun TextPanel(
                 )
             }
 
+            TextTab.Font -> {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    PanelLabel("Pilih font bawaan atau impor .ttf / .otf dari HP")
+                    GhostButton("+ Import Font", onImportFont, icon = ConcatIcons.Import, height = 30.dp)
+                }
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                ) {
+                    for (builtIn in BUILTIN_FONTS) {
+                        ChoiceChip(
+                            builtIn,
+                            selected = fontFamily.equals(builtIn, ignoreCase = true),
+                            onClick = {
+                                fontFamily = builtIn
+                                pushLive()
+                            },
+                        )
+                    }
+                    for (custom in customFonts) {
+                        ChoiceChip(
+                            custom.family,
+                            selected = fontFamily.equals(custom.family, ignoreCase = true),
+                            onClick = {
+                                fontFamily = custom.family
+                                pushLive()
+                            },
+                        )
+                    }
+                }
+                if (customFonts.isEmpty()) {
+                    PanelLabel("Belum ada custom font. Tap + Import Font untuk memilih file font dari penyimpanan.")
+                }
+            }
+
             TextTab.Fill -> {
-                ColorPickerRow(
+                FullColorPalette(
                     selectedHex = colour,
+                    savedColors = savedColors,
                     eyedropperActive = eyedropperActive && colorTarget == ColorTarget.Fill,
                     onToggleEyedropper = {
                         colorTarget = ColorTarget.Fill
                         onToggleEyedropper(!eyedropperActive)
                     },
+                    onSaveColor = { onSaveColor(colour) },
+                    onRemoveColor = onRemoveColor,
                     onPick = { hex ->
                         colour = hex
                         pushLive()
@@ -305,13 +392,16 @@ fun TextPanel(
                     { if (it <= 0.0002f) "Off" else "%.1f".format(it * 1000f) },
                     onChange = { strokeWidth = it; pushLive() },
                 )
-                ColorPickerRow(
+                FullColorPalette(
                     selectedHex = strokeColour,
+                    savedColors = savedColors,
                     eyedropperActive = eyedropperActive && colorTarget == ColorTarget.Outline,
                     onToggleEyedropper = {
                         colorTarget = ColorTarget.Outline
                         onToggleEyedropper(!eyedropperActive)
                     },
+                    onSaveColor = { onSaveColor(strokeColour) },
+                    onRemoveColor = onRemoveColor,
                     onPick = { hex ->
                         strokeColour = hex
                         if (strokeWidth <= 0f) strokeWidth = 0.005f
@@ -333,13 +423,16 @@ fun TextPanel(
                         onClick = { plateColour = null; pushLive() },
                     )
                 }
-                ColorPickerRow(
-                    selectedHex = plateColour ?: "",
+                FullColorPalette(
+                    selectedHex = plateColour ?: "#000000",
+                    savedColors = savedColors,
                     eyedropperActive = eyedropperActive && colorTarget == ColorTarget.Box,
                     onToggleEyedropper = {
                         colorTarget = ColorTarget.Box
                         onToggleEyedropper(!eyedropperActive)
                     },
+                    onSaveColor = { onSaveColor(plateColour ?: "#000000") },
+                    onRemoveColor = onRemoveColor,
                     onPick = { hex ->
                         plateColour = hex
                         pushLive()
@@ -350,24 +443,36 @@ fun TextPanel(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ColorPickerRow(
+private fun FullColorPalette(
     selectedHex: String,
+    savedColors: List<String>,
     eyedropperActive: Boolean,
     onToggleEyedropper: () -> Unit,
+    onSaveColor: () -> Unit,
+    onRemoveColor: (String) -> Unit,
     onPick: (String) -> Unit,
 ) {
+    val initialHsv = remember(selectedHex) { hsvOfHex(selectedHex) }
+    var hue by remember(selectedHex) { mutableFloatStateOf(initialHsv[0]) }
+    var sat by remember(selectedHex) { mutableFloatStateOf(initialHsv[1]) }
+    var value by remember(selectedHex) { mutableFloatStateOf(initialHsv[2]) }
+    var showSpectrum by remember { mutableStateOf(false) }
+
     Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
         if (eyedropperActive) {
             PanelLabel("Geser jari di atas video preview untuk mengambil warna.")
         }
+
+        // Baris 1: Eyedropper + Preview Warna Aktif + Hex + Tombol Palette Spektrum + Save Warna
         Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
-                Modifier.size(34.dp).clip(CircleShape)
+                Modifier.size(32.dp).clip(CircleShape)
                     .background(if (eyedropperActive) ConcatColors.accent else ConcatColors.raised)
                     .border(1.dp, if (eyedropperActive) ConcatColors.accent else ConcatColors.lineStrong, CircleShape)
                     .clickable { onToggleEyedropper() },
@@ -376,15 +481,155 @@ private fun ColorPickerRow(
                 ConcatIcon(
                     ConcatIcons.Wand,
                     tint = if (eyedropperActive) ConcatColors.onAccent else ConcatColors.fg,
-                    size = 18.dp,
+                    size = 16.dp,
                 )
             }
+
+            Box(
+                Modifier.size(28.dp).clip(CircleShape)
+                    .background(colourOf(selectedHex))
+                    .border(1.5.dp, Color.White, CircleShape),
+            )
+
+            Text(
+                selectedHex.uppercase(Locale.US),
+                style = ConcatType.badge,
+                color = ConcatColors.fg,
+            )
+
+            Spacer(Modifier.weight(1f))
+
+            ChoiceChip(
+                if (showSpectrum) "Tutup Palette" else "Palette",
+                selected = showSpectrum,
+                onClick = { showSpectrum = !showSpectrum },
+            )
+
+            ChoiceChip(
+                "+ Save",
+                selected = false,
+                onClick = onSaveColor,
+            )
+        }
+
+        // Spectrum Color Picker (2D Saturation/Value + Hue Slider)
+        if (showSpectrum) {
+            val pureHueColor = Color.hsv(hue, 1f, 1f)
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(92.dp)
+                    .clip(RoundedCornerShape(Radii.md))
+                    .border(1.dp, ConcatColors.lineStrong, RoundedCornerShape(Radii.md))
+                    .pointerInput(hue) {
+                        detectTapGestures { offset ->
+                            val s = (offset.x / size.width).coerceIn(0f, 1f)
+                            val v = (1f - offset.y / size.height).coerceIn(0f, 1f)
+                            sat = s
+                            value = v
+                            onPick(hexFromColor(Color.hsv(hue, s, v)))
+                        }
+                    }
+                    .pointerInput(hue) {
+                        detectDragGestures { change, _ ->
+                            change.consume()
+                            val s = (change.position.x / size.width).coerceIn(0f, 1f)
+                            val v = (1f - change.position.y / size.height).coerceIn(0f, 1f)
+                            sat = s
+                            value = v
+                            onPick(hexFromColor(Color.hsv(hue, s, v)))
+                        }
+                    },
+            ) {
+                Canvas(Modifier.fillMaxSize()) {
+                    drawRect(Brush.horizontalGradient(listOf(Color.White, pureHueColor)))
+                    drawRect(Brush.verticalGradient(listOf(Color.Transparent, Color.Black)))
+                    val cx = sat * size.width
+                    val cy = (1f - value) * size.height
+                    drawCircle(Color.White, radius = 7.dp.toPx(), center = Offset(cx, cy), style = Stroke(width = 2.dp.toPx()))
+                    drawCircle(Color.Black, radius = 5.dp.toPx(), center = Offset(cx, cy), style = Stroke(width = 1.dp.toPx()))
+                }
+            }
+
+            // Hue Rainbow Slider
+            val rainbow = remember {
+                listOf(
+                    Color.hsv(0f, 1f, 1f),
+                    Color.hsv(60f, 1f, 1f),
+                    Color.hsv(120f, 1f, 1f),
+                    Color.hsv(180f, 1f, 1f),
+                    Color.hsv(240f, 1f, 1f),
+                    Color.hsv(300f, 1f, 1f),
+                    Color.hsv(360f, 1f, 1f),
+                )
+            }
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(22.dp)
+                    .clip(CircleShape)
+                    .border(1.dp, ConcatColors.lineStrong, CircleShape)
+                    .pointerInput(Unit) {
+                        detectTapGestures { offset ->
+                            val h = ((offset.x / size.width).coerceIn(0f, 1f)) * 360f
+                            hue = h
+                            onPick(hexFromColor(Color.hsv(h, sat.coerceAtLeast(0.15f), value.coerceAtLeast(0.15f))))
+                        }
+                    }
+                    .pointerInput(Unit) {
+                        detectDragGestures { change, _ ->
+                            change.consume()
+                            val h = ((change.position.x / size.width).coerceIn(0f, 1f)) * 360f
+                            hue = h
+                            onPick(hexFromColor(Color.hsv(h, sat.coerceAtLeast(0.15f), value.coerceAtLeast(0.15f))))
+                        }
+                    },
+            ) {
+                Canvas(Modifier.fillMaxSize()) {
+                    drawRect(Brush.horizontalGradient(rainbow))
+                    val hx = (hue / 360f) * size.width
+                    drawCircle(Color.White, radius = 9.dp.toPx(), center = Offset(hx, size.height / 2f), style = Stroke(width = 2.5.dp.toPx()))
+                }
+            }
+        }
+
+        // Baris 2: Saved Colors (tahan lama untuk hapus)
+        if (savedColors.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Saved:", style = ConcatType.caption, color = ConcatColors.fgMuted)
+                for (hex in savedColors) {
+                    val picked = hex.equals(selectedHex, ignoreCase = true)
+                    Box(
+                        Modifier.size(28.dp).clip(CircleShape)
+                            .border(if (picked) 2.dp else 1.dp, if (picked) ConcatColors.accent else ConcatColors.lineStrong, CircleShape)
+                            .padding(if (picked) 3.dp else 0.dp)
+                            .clip(CircleShape)
+                            .background(colourOf(hex))
+                            .combinedClickable(
+                                onClick = { onPick(hex) },
+                                onLongClick = { onRemoveColor(hex) },
+                            ),
+                    )
+                }
+            }
+        }
+
+        // Baris 3: Swatch Preset Bawaan
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             for (hex in TEXT_COLOURS) {
                 val picked = hex.equals(selectedHex, ignoreCase = true)
                 Box(
-                    Modifier.size(32.dp).clip(CircleShape)
+                    Modifier.size(28.dp).clip(CircleShape)
                         .border(if (picked) 2.dp else 1.dp, if (picked) ConcatColors.accent else ConcatColors.lineStrong, CircleShape)
-                        .padding(if (picked) 4.dp else 0.dp)
+                        .padding(if (picked) 3.dp else 0.dp)
                         .clip(CircleShape)
                         .background(colourOf(hex))
                         .clickable { onPick(hex) },
@@ -586,4 +831,3 @@ fun BackgroundPanel(onPick: (JSONObject) -> Unit, onClose: () -> Unit) {
         }
     }
 }
-
