@@ -221,8 +221,10 @@ fun PreviewOverlay(
                 val over = hit?.takeIf { it.id != chosen?.id && it.trackId != mainTrackId }
                 if (chosen != null) {
                     val box = boxOf(v, chosen, live?.takeIf { it.first == chosen.id }?.second ?: Placement.of(chosen), frame, currentBounds)
+                    val cornerReach = if (chosen.kind == ClipKind.Text) 16.dp.toPx() else handleReach
                     when {
-                        box.corners.any { (it - down.position).getDistance() < handleReach } -> grip = Grip.Corner
+                        box.corners.any { (it - down.position).getDistance() < cornerReach } -> grip = Grip.Corner
+                        chosen.kind == ClipKind.Text -> grip = Grip.Body
                         over == null && box.contains(down.position, 6f) -> grip = Grip.Body
                     }
                     if (grip != Grip.None) target = chosen
@@ -309,8 +311,12 @@ fun PreviewOverlay(
                     commit(clip.id, now)
                 } else {
                     val time = down.uptimeMillis
-                    if (clip.kind == ClipKind.Text && lastTap.first == clip.id && time - lastTap.second < viewConfiguration.doubleTapTimeoutMillis + 100) {
+                    val tappedInsideChosen = startBox.contains(down.position, 8f)
+                    if (clip.kind == ClipKind.Text && tappedInsideChosen && lastTap.first == clip.id && time - lastTap.second < viewConfiguration.doubleTapTimeoutMillis + 100) {
                         editText(clip.id)
+                        lastTap = Pair("", 0L)
+                    } else if (chosen != null && chosen.kind == ClipKind.Text && !tappedInsideChosen) {
+                        if (over != null) select(over.id) else select(null)
                         lastTap = Pair("", 0L)
                     } else {
                         lastTap = Pair(clip.id, time)
