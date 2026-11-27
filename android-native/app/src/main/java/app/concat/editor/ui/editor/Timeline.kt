@@ -102,6 +102,11 @@ private data class DragPreview(
     val snappedAt: Double?,
 )
 
+private data class SubLanePack(
+    val assignments: Map<String, Int>,
+    val laneCount: Int,
+)
+
 private class FeatureLaneRow(
     val group: FeatureGroup,
     val trackId: String,
@@ -690,8 +695,8 @@ private val SUB_LANE_GAP = 4.dp
 
 private enum class Outcome { Tap, Pan, LongPress }
 
-private fun packSubLanes(clips: List<Clip>, startLane: Int = 0): Pair, Int> {
-    if (clips.isEmpty()) return emptyMap<String, Int>() to max(1, startLane)
+private fun packSubLanes(clips: List<Clip>, startLane: Int = 0): SubLanePack {
+    if (clips.isEmpty()) return SubLanePack(emptyMap(), max(1, startLane))
     val sorted = clips.sortedWith(compareBy<Clip> { it.start }.thenBy { it.id })
     val laneEnds = ArrayList<Double>()
     val result = HashMap<String, Int>(sorted.size)
@@ -710,7 +715,7 @@ private fun packSubLanes(clips: List<Clip>, startLane: Int = 0): Pair, Int> {
         }
         result[clip.id] = startLane + assigned
     }
-    return result to (startLane + laneEnds.size)
+    return SubLanePack(result, startLane + laneEnds.size)
 }
 
 private fun layoutFeatureLanes(
@@ -753,9 +758,9 @@ private fun layoutFeatureLanes(
 
         val subLaneCount = if (isExpanded) {
             val startLane = if (group == FeatureGroup.Audio && hasMainMedia) 1 else 0
-            val (assignments, count) = packSubLanes(groupClips, startLane)
-            clipSubLane.putAll(assignments)
-            count.coerceAtLeast(1)
+            val packed = packSubLanes(groupClips, startLane)
+            clipSubLane.putAll(packed.assignments)
+            packed.laneCount.coerceAtLeast(1)
         } else {
             groupClips.forEach { clipSubLane[it.id] = 0 }
             1
