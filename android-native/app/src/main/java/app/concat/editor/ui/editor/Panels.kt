@@ -158,7 +158,17 @@ val TEXT_COLOURS = listOf(
     "#cbf53f", "#ffd60a", "#ff9f0a", "#ff375f", "#bf5af2", "#0a84ff", "#30d158",
 )
 
-private val BUILTIN_FONTS = listOf("Hanken Grotesk", "sans-serif", "serif", "monospace")
+private val BUILTIN_FONTS = listOf(
+    "Hanken Grotesk",
+    "Roboto",
+    "Noto Sans",
+    "Noto Serif",
+    "Dancing Script",
+    "Cutive Mono",
+    "sans-serif",
+    "serif",
+    "monospace",
+)
 
 fun colourOf(hex: String): Color = try {
     Color(android.graphics.Color.parseColor(hex))
@@ -214,6 +224,7 @@ fun TextPanel(
     var content by remember(existing?.id) { mutableStateOf(style?.optString("content") ?: "") }
     var size by remember(existing?.id) { mutableFloatStateOf((style?.optDouble("fontSize", 0.07) ?: 0.07).toFloat()) }
     var fontFamily by remember(existing?.id) { mutableStateOf(style?.optString("fontFamily", "Hanken Grotesk")?.ifBlank { "Hanken Grotesk" } ?: "Hanken Grotesk") }
+    var fontPath by remember(existing?.id) { mutableStateOf(style?.optString("fontPath")?.ifBlank { null }) }
     var colour by remember(existing?.id) { mutableStateOf(style?.optString("color", "#ffffff") ?: "#ffffff") }
     var weight by remember(existing?.id) { mutableStateOf(style?.optDouble("fontWeight", 700.0) ?: 700.0) }
     var italic by remember(existing?.id) { mutableStateOf(style?.optBoolean("italic", false) ?: false) }
@@ -238,6 +249,7 @@ fun TextPanel(
         plate = plateColour,
         clearPlate = plateColour == null,
         fontFamily = fontFamily,
+        fontPath = fontPath,
     )
 
     fun pushLive() {
@@ -343,19 +355,25 @@ fun TextPanel(
                     for (builtIn in BUILTIN_FONTS) {
                         ChoiceChip(
                             builtIn,
-                            selected = fontFamily.equals(builtIn, ignoreCase = true),
+                            selected = fontPath == null && fontFamily.equals(builtIn, ignoreCase = true),
                             onClick = {
                                 fontFamily = builtIn
+                                fontPath = null
                                 pushLive()
                             },
                         )
                     }
                     for (custom in customFonts) {
+                        val isSelected = fontPath == custom.path ||
+                            (fontPath == null && fontFamily.equals(custom.family, ignoreCase = true) && abs(weight - custom.weight) < 50.0 && italic == custom.italic)
                         ChoiceChip(
-                            custom.family,
-                            selected = fontFamily.equals(custom.family, ignoreCase = true),
+                            custom.label,
+                            selected = isSelected,
                             onClick = {
                                 fontFamily = custom.family
+                                fontPath = custom.path
+                                weight = custom.weight
+                                italic = custom.italic
                                 pushLive()
                             },
                         )
@@ -465,7 +483,6 @@ private fun FullColorPalette(
             PanelLabel("Geser jari di atas video preview untuk mengambil warna.")
         }
 
-        // Baris 1: Eyedropper + Preview Warna Aktif + Hex + Tombol Palette Spektrum + Save Warna
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -512,7 +529,6 @@ private fun FullColorPalette(
             )
         }
 
-        // Spectrum Color Picker (2D Saturation/Value + Hue Slider)
         if (showSpectrum) {
             val pureHueColor = Color.hsv(hue, 1f, 1f)
             Box(
@@ -551,7 +567,6 @@ private fun FullColorPalette(
                 }
             }
 
-            // Hue Rainbow Slider
             val rainbow = remember {
                 listOf(
                     Color.hsv(0f, 1f, 1f),
@@ -593,7 +608,6 @@ private fun FullColorPalette(
             }
         }
 
-        // Baris 2: Saved Colors (tahan lama untuk hapus)
         if (savedColors.isNotEmpty()) {
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
@@ -618,7 +632,6 @@ private fun FullColorPalette(
             }
         }
 
-        // Baris 3: Swatch Preset Bawaan
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
