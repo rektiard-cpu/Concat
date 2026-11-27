@@ -336,6 +336,7 @@ object Commands {
         plate: String? = null,
         clearPlate: Boolean = false,
         fontFamily: String? = null,
+        fontPath: String? = null,
     ): JSONObject = JSONObject(base?.toString() ?: "{}")
         .put("content", content)
         .put("fontSize", fontSize)
@@ -349,5 +350,6 @@ object Commands {
             if (clearPlate) put("plate", JSONObject.NULL)
             else if (plate != null) put("plate", plate)
             if (!fontFamily.isNullOrBlank()) put("fontFamily", fontFamily)
+            if (!fontPath.isNullOrBlank()) put("fontPath", fontPath)
         }
 }
