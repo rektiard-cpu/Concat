@@ -4,6 +4,7 @@
 package app.concat.editor.ui.editor
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -130,6 +131,7 @@ fun PreviewOverlay(
     onCommit: (clipId: String, placement: Placement) -> Unit,
     onEditText: (clipId: String) -> Unit,
     modifier: Modifier = Modifier,
+    onDrag: ((clipId: String, placement: Placement) -> Unit)? = null,
     eyedropperFrame: Bitmap? = null,
     onPickColor: ((String) -> Unit)? = null,
 ) {
@@ -146,6 +148,7 @@ fun PreviewOverlay(
     val currentFrame by rememberUpdatedState(eyedropperFrame)
     val pickColor by rememberUpdatedState(onPickColor)
     val select by rememberUpdatedState(onSelect)
+    val drag by rememberUpdatedState(onDrag)
     val commit by rememberUpdatedState(onCommit)
     val editText by rememberUpdatedState(onEditText)
     val rotateGlyph = rememberVectorPainter(ConcatIcons.Rotate)
@@ -254,6 +257,7 @@ fun PreviewOverlay(
                 val grabbed = down.position - startBox.anchor
                 var travelled = 0f
                 var twoFingers = false
+                var lastDragSentAt = 0L
                 val snapPx = 8.dp.toPx()
                 var snapped = Pair(false, false)
                 moving = true
@@ -301,6 +305,11 @@ fun PreviewOverlay(
                     if (travelled > viewConfiguration.touchSlop) {
                         live = clip.id to now
                         guides = snapped
+                        val tick = SystemClock.uptimeMillis()
+                        if (tick - lastDragSentAt >= 28L) {
+                            lastDragSentAt = tick
+                            drag?.invoke(clip.id, now)
+                        }
                     }
                     event.changes.forEach { it.consume() }
                 }
