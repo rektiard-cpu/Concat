@@ -3,6 +3,7 @@
 
 package app.concat.editor.ui.editor
 
+import android.util.LruCache
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FloatExponentialDecaySpec
 import androidx.compose.animation.core.animateDecay
@@ -32,6 +33,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
@@ -43,12 +45,15 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -80,6 +85,15 @@ sealed interface LaneTarget {
     data object NewBottom : LaneTarget
 }
 
+private enum class FeatureGroup(val label: String) {
+    Effects("Effects"),
+    Sticker("Sticker"),
+    Text("Text"),
+    Overlay("Overlay"),
+    Main("Video"),
+    Audio("Audio"),
+}
+
 private data class DragPreview(
     val clipId: String,
     val start: Double,
@@ -88,24 +102,30 @@ private data class DragPreview(
     val snappedAt: Double?,
 )
 
-private class LaneRow(val trackIndex: Int, val trackId: String, val top: Float, val height: Float, val main: Boolean) {
+private class FeatureLaneRow(
+    val group: FeatureGroup,
+    val trackId: String,
+    val top: Float,
+    val height: Float,
+) {
     val bottom get() = top + height
     val centre get() = top + height / 2f
+    val main get() = group == FeatureGroup.Main
 }
 
-private class LaneLayout(val rows: List<LaneRow>, val gap: Float) {
+private class LaneLayout(val rows: List<FeatureLaneRow>, val gap: Float) {
     val top get() = rows.firstOrNull()?.top ?: 0f
     val bottom get() = rows.lastOrNull()?.bottom ?: 0f
     val main get() = rows.firstOrNull { it.main }
 
     fun rowAt(y: Float): Int {
         if (rows.isEmpty()) return 0
-        if (y < top - gap) return -1
+        if (y < top - gap) return 0
         rows.forEachIndexed { i, row -> if (y < row.bottom + gap / 2f) return i }
-        return if (y > bottom + gap * 2 + 12f) rows.size else rows.size - 1
+        return rows.size - 1
     }
 
-    fun rowOfTrack(trackId: String) = rows.indexOfFirst { it.trackId == trackId }
+    fun rowOfGroup(group: FeatureGroup) = rows.indexOfFirst { it.group == group }
 }
 
 private const val MIN_LENGTH = 1.0 / 60
@@ -113,10 +133,20 @@ private const val MIN_LENGTH = 1.0 / 60
 private val COLOR_TEXT_IMPORTED = Color(0xFF2563EB)   // Biru: hasil import SRT/ASS
 private val COLOR_TEXT_DEFAULT = Color(0xFFEC4899)    // Pink: teks default / add text biasa
 private val COLOR_TEXT_DUPLICATE = Color(0xFFEAB308)  // Kuning: teks duplikat
+private val COLOR_MARKER = Color(0xFF38BDF8)          // Biru terang: penanda irama / beat marker
 
 fun mainTrackIndex(view: ProjectView): Int {
     val pictures = view.clips.filter { it.kind == ClipKind.Video || it.kind == ClipKind.Image }.map { it.trackId }.toSet()
     return view.tracks.indexOfFirst { it.id in pictures }.takeIf { it >= 0 } ?: 0
+}
+
+private fun featureGroupOf(clip: Clip, mainTrackId: String?): FeatureGroup = when {
+    clip.kind == ClipKind.Text -> FeatureGroup.Text
+    clip.kind == ClipKind.Shape -> FeatureGroup.Sticker
+    clip.kind == ClipKind.Audio || clip.kind == ClipKind.SoundLayer -> FeatureGroup.Audio
+    clip.kind == ClipKind.Layer || (clip.kind == ClipKind.Transition && clip.trackId != mainTrackId) -> FeatureGroup.Effects
+    clip.trackId == mainTrackId -> FeatureGroup.Main
+    else -> FeatureGroup.Overlay
 }
 
 private class TimelineGlyphs(
@@ -133,6 +163,25 @@ private class TimelineGlyphs(
     val shapes: VectorPainter,
 )
 
+/** Cache pengukuran teks agar playback timeline berjalan mulus tanpa alokasi ulang tiap frame. */
+private class TextLayoutCache(private val measurer: TextMeasurer) {
+    private val cache = LruCache<String, TextLayoutResult>(256)
+
+    fun measure(text: String, style: TextStyle, maxWidth: Int = Int.MAX_VALUE): TextLayoutResult {
+        val key = "$text|${style.fontSize.value}|${style.color.value}|$maxWidth"
+        cache.get(key)?.let { return it }
+        val measured = measurer.measure(
+            text = text,
+            style = style,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            constraints = if (maxWidth == Int.MAX_VALUE) Constraints() else Constraints(maxWidth = maxWidth.coerceAtLeast(1)),
+        )
+        cache.put(key, measured)
+        return measured
+    }
+}
+
 @Composable
 fun Timeline(
     view: ProjectView,
@@ -141,6 +190,7 @@ fun Timeline(
     position: Double,
     selected: String?,
     clipRoles: Map<String, String> = emptyMap(),
+    markers: List<Double> = emptyList(),
     onScrub: (Double) -> Unit,
     onSelect: (String?) -> Unit,
     onMove: (clipId: String, start: Double, target: LaneTarget) -> Unit,
@@ -159,9 +209,12 @@ fun Timeline(
     val scope = rememberCoroutineScope()
     val haptics = LocalHapticFeedback.current
     val measurer = rememberTextMeasurer()
+    val textCache = remember(measurer) { TextLayoutCache(measurer) }
+    val reusablePath = remember { Path() }
     val currentView by rememberUpdatedState(view)
     val currentPosition by rememberUpdatedState(position)
     val currentSelected by rememberUpdatedState(selected)
+    val currentMarkers by rememberUpdatedState(markers)
     val scrub by rememberUpdatedState(onScrub)
     val choose by rememberUpdatedState(onSelect)
     val move by rememberUpdatedState(onMove)
@@ -204,9 +257,10 @@ fun Timeline(
                 val handleWidth = HANDLE.toPx()
 
                 fun snap(times: List<Double>, exclude: String, scale: Float, playhead: Double): Pair<Double, Int>? {
-                    val points = ArrayList<Double>()
+                    val points = ArrayList<Double>(currentView.clips.size * 2 + currentMarkers.size + 4)
                     points += playhead
                     points += 0.0
+                    for (m in currentMarkers) points += m
                     for (clip in currentView.clips) {
                         if (clip.id == exclude) continue
                         points += clip.start
@@ -232,23 +286,39 @@ fun Timeline(
                     scope.launch { knob.animateTo(1f, Motion.knob()) }
                     try {
                         val view = currentView
+                        val mainTrackId = view.tracks.getOrNull(mainTrackIndex(view))?.id
                         val scale = scaleNow()
                         val playhead = currentPosition
-                        val layout = layoutLanes(view, size.height.toFloat(), scrollY, this)
+                        val layout = layoutFeatureLanes(view, mainTrackId, size.height.toFloat(), scrollY, this)
                         val centre = size.width / 2f
                         fun timeAt(x: Float) = playhead + (x - centre) / scale
                         fun xOf(t: Double) = centre + ((t - playhead) * scale).toFloat()
                         val downRowIndex = layout.rowAt(down.position.y)
                         val downRow = layout.rows.getOrNull(downRowIndex)
                         val downTime = timeAt(down.position.x)
-                        val hit = view.clips.firstOrNull {
-                            it.trackId == downRow?.trackId && downTime >= it.start && downTime < it.end &&
-                                down.position.y >= downRow.top && down.position.y <= downRow.bottom
+
+                        // Deteksi klip yang diketuk di baris fitur tersebut (mendukung cycling jika teks bertumpuk)
+                        val matchingClips = if (downRow != null && down.position.y >= downRow.top && down.position.y <= downRow.bottom) {
+                            view.clips.filter { clip ->
+                                featureGroupOf(clip, mainTrackId) == downRow.group &&
+                                    downTime >= clip.start && downTime < clip.end
+                            }
+                        } else {
+                            emptyList()
+                        }
+                        val hit = when {
+                            matchingClips.isEmpty() -> null
+                            matchingClips.size == 1 -> matchingClips.first()
+                            else -> {
+                                val selIdx = matchingClips.indexOfFirst { it.id == currentSelected }
+                                if (selIdx >= 0) matchingClips[(selIdx + 1) % matchingClips.size] else matchingClips.last()
+                            }
                         }
 
                         val chosen = view.clip(currentSelected)
                         val edge = chosen?.let { clip ->
-                            val row = layout.rows.getOrNull(layout.rowOfTrack(clip.trackId)) ?: return@let null
+                            val group = featureGroupOf(clip, mainTrackId)
+                            val row = layout.rows.getOrNull(layout.rowOfGroup(group)) ?: return@let null
                             val inLane = down.position.y >= row.top - 6f && down.position.y <= row.bottom + 6f
                             val left = xOf(clip.start)
                             val right = xOf(clip.end)
@@ -262,7 +332,7 @@ fun Timeline(
                         }
                         if (chosen != null && edge != null) {
                             down.consume()
-                            val row = layout.rowOfTrack(chosen.trackId)
+                            val row = layout.rowOfGroup(featureGroupOf(chosen, mainTrackId))
                             val (low, high) = trimRange(view, chosen, edge)
                             var delta = 0.0
                             var lastSnap: Double? = null
@@ -324,7 +394,13 @@ fun Timeline(
                                 is TimelineButton.Cut -> transition(tapped.nextClipId)
                                 is TimelineButton.Mute -> muteTrack(tapped.trackId, tapped.mute)
                                 TimelineButton.Cover -> openCover()
-                                null -> choose(if (hit?.id == currentSelected) null else hit?.id)
+                                null -> {
+                                    if (matchingClips.size > 1 && hit != null) {
+                                        choose(hit.id)
+                                    } else {
+                                        choose(if (hit?.id == currentSelected) null else hit?.id)
+                                    }
+                                }
                             }
                             return@awaitEachGesture
                         }
@@ -334,7 +410,7 @@ fun Timeline(
                             choose(hit.id)
                             val grab = downTime - hit.start
                             var start = hit.start
-                            var row = layout.rowOfTrack(hit.trackId)
+                            val row = layout.rowOfGroup(featureGroupOf(hit, mainTrackId))
                             var lastSnap: Double? = null
                             drag = DragPreview(hit.id, start, hit.duration, row, null)
                             while (true) {
@@ -351,17 +427,12 @@ fun Timeline(
                                     snapped.second == 0 -> snapped.first
                                     else -> snapped.first - hit.duration
                                 }.coerceAtLeast(0.0)
-                                row = layout.rowAt(change.position.y).coerceIn(-1, layout.rows.size)
                                 drag = DragPreview(hit.id, start, hit.duration, row, snapped?.first)
                             }
                             drag = null
-                            val target = when {
-                                row < 0 -> LaneTarget.NewTop
-                                row >= layout.rows.size -> LaneTarget.NewBottom
-                                else -> LaneTarget.Existing(layout.rows[row].trackId)
+                            if (abs(start - hit.start) > 1e-4) {
+                                move(hit.id, start, LaneTarget.Existing(hit.trackId))
                             }
-                            val sameLane = target is LaneTarget.Existing && target.trackId == hit.trackId
-                            if (!sameLane || abs(start - hit.start) > 1e-4) move(hit.id, start, target)
                             return@awaitEachGesture
                         }
 
@@ -418,8 +489,11 @@ fun Timeline(
     ) {
         val scale = if (pxPerSecond <= 0f) 64.dp.toPx() else pxPerSecond
         val centre = size.width / 2f
-        val layout = layoutLanes(view, size.height, scrollY, this)
+        val mainTrackId = view.tracks.getOrNull(mainTrackIndex(view))?.id
+        val layout = layoutFeatureLanes(view, mainTrackId, size.height, scrollY, this)
         fun x(seconds: Double) = centre + ((seconds - position) * scale).toFloat()
+        val leftVisibleTime = position - (centre + 40.dp.toPx()) / scale
+        val rightVisibleTime = position + (centre + 40.dp.toPx()) / scale
         media.version
 
         drawRect(ConcatColors.page)
@@ -428,60 +502,109 @@ fun Timeline(
 
         clipRect(top = RULER.toPx()) {
             for (row in layout.rows) {
-                drawRoundRect(
+                drawRect(
                     if (row.main) ConcatColors.well else ConcatColors.launchPanel.copy(alpha = 0.6f),
                     Offset(0f, row.top),
                     Size(size.width, row.height),
-                    CornerRadius(0f),
                 )
             }
+
+            // 1. Gambar klip tiap baris fitur (dengan viewport culling agar 60fps tanpa lag)
             for (row in layout.rows) {
-                for (clip in view.clips) {
-                    if (clip.trackId != row.trackId) continue
+                if (row.group == FeatureGroup.Audio) {
+                    // Gambar gelombang audio dari video utama di baris paling bawah
+                    for (clip in view.clips) {
+                        if (clip.trackId != mainTrackId || clip.kind != ClipKind.Video) continue
+                        if (clip.end < leftVisibleTime || clip.start > rightVisibleTime) continue
+                        val file = view.mediaOf(clip)?.path ?: continue
+                        val waveColor = if (clip.muted) ConcatColors.fgDim.copy(alpha = 0.45f) else KindColors.of(ClipKind.Audio).color
+                        val box = Rect(x(clip.start) + 1f, row.top + 4.dp.toPx(), max(x(clip.start) + 3f, x(clip.end) - 1f), row.bottom - 4.dp.toPx())
+                        drawWaveform(media, projectPath, file, clip, box, waveColor)
+                    }
+                }
+
+                val laneClips = view.clips.filter { clip ->
+                    featureGroupOf(clip, mainTrackId) == row.group &&
+                        clip.end >= leftVisibleTime && clip.start <= rightVisibleTime
+                }
+                val orderedClips = if (row.group == FeatureGroup.Text) {
+                    laneClips.sortedWith(
+                        compareBy<Clip> { it.id == selected }
+                            .thenBy { clipRoles[it.id] != EditorViewModel.ROLE_IMPORTED }
+                            .thenBy { it.start },
+                    )
+                } else {
+                    laneClips
+                }
+
+                for (clip in orderedClips) {
                     val beingMoved = moving?.clipId == clip.id
+                    val hasOverlap = row.group == FeatureGroup.Text &&
+                        clipRoles[clip.id] != EditorViewModel.ROLE_IMPORTED &&
+                        orderedClips.any { other -> other.id != clip.id && other.start < clip.end && other.end > clip.start }
                     drawClip(
-                        measurer, glyphs, media, projectPath, view, clip, clipRoles[clip.id], x(clip.start), x(clip.end), row,
+                        textCache = textCache,
+                        reusablePath = reusablePath,
+                        glyphs = glyphs,
+                        media = media,
+                        projectPath = projectPath,
+                        view = view,
+                        clip = clip,
+                        role = clipRoles[clip.id],
+                        left = x(clip.start),
+                        right = x(clip.end),
+                        row = row,
                         alpha = if (beingMoved) 0.3f else 1f,
+                        stackedInset = hasOverlap,
                     )
                 }
             }
-            if (main != null) drawMainExtras(measurer, glyphs, media, view, main, selected, cover, ::x)
+
+            if (main != null) drawMainExtras(textCache, reusablePath, glyphs, media, view, main, selected, cover, ::x)
+
+            // 2. Gambar label/ikon fitur di bilah paling kiri (di atas dan di bawah Cover)
+            for (row in layout.rows) {
+                if (!row.main) {
+                    drawFeatureGutterBadge(textCache, glyphs, row)
+                }
+            }
+
+            // 3. Gambar garis vertikal penanda irama (Beat Markers)
+            for (m in markers) {
+                if (m < leftVisibleTime || m > rightVisibleTime) continue
+                val mx = x(m)
+                drawLine(
+                    color = COLOR_MARKER.copy(alpha = 0.72f),
+                    start = Offset(mx, RULER.toPx()),
+                    end = Offset(mx, size.height),
+                    strokeWidth = 1.5.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f)),
+                )
+            }
 
             val chosen = view.clip(selected)
             if (chosen != null && moving?.clipId != chosen.id) {
-                layout.rows.getOrNull(layout.rowOfTrack(chosen.trackId))?.let { row ->
-                    drawSelection(measurer, chosen, x(chosen.start), x(chosen.end), row, selection.value)
+                layout.rows.getOrNull(layout.rowOfGroup(featureGroupOf(chosen, mainTrackId)))?.let { row ->
+                    drawSelection(textCache, reusablePath, chosen, x(chosen.start), x(chosen.end), row, selection.value)
                 }
             }
 
             if (moving != null) {
                 val clip = view.clip(moving.clipId)
-                if (clip != null) {
-                    val gap = layout.gap
-                    val row = when {
-                        moving.row < 0 -> LaneRow(-1, "", layout.top - gap - Dimens.overlayLane.toPx(), Dimens.overlayLane.toPx(), false)
-                        moving.row >= layout.rows.size -> LaneRow(-1, "", layout.bottom + gap, Dimens.overlayLane.toPx(), false)
-                        else -> layout.rows[moving.row]
-                    }
-                    if (moving.row < 0 || moving.row >= layout.rows.size) {
-                        val y = if (moving.row < 0) layout.top - gap / 2f else layout.bottom + gap / 2f
-                        drawLine(
-                            ConcatColors.accent, Offset(0f, y), Offset(size.width, y), strokeWidth = 2.dp.toPx(),
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f)),
-                        )
-                    }
+                if (clip != null && moving.row in layout.rows.indices) {
+                    val row = layout.rows[moving.row]
                     val left = x(moving.start)
                     val right = x(moving.start + moving.duration)
-                    drawClip(measurer, glyphs, media, projectPath, view, clip, clipRoles[clip.id], left, right, row, alpha = 0.92f)
-                    drawSelection(measurer, clip.copy(start = moving.start, duration = moving.duration), left, right, row, 1f)
+                    drawClip(textCache, reusablePath, glyphs, media, projectPath, view, clip, clipRoles[clip.id], left, right, row, alpha = 0.92f)
+                    drawSelection(textCache, reusablePath, clip.copy(start = moving.start, duration = moving.duration), left, right, row, 1f)
                 }
                 moving.snappedAt?.let { at ->
-                    drawLine(ConcatColors.accent, Offset(x(at), RULER.toPx()), Offset(x(at), size.height), strokeWidth = 1.dp.toPx())
+                    drawLine(ConcatColors.accent, Offset(x(at), RULER.toPx()), Offset(x(at), size.height), strokeWidth = 1.5.dp.toPx())
                 }
             }
         }
 
-        drawRuler(measurer, position, scale, centre)
+        drawRuler(textCache, reusablePath, position, scale, centre, markers)
 
         val head = ConcatColors.accent
         val knobY = RULER.toPx() - 7.dp.toPx()
@@ -493,47 +616,63 @@ fun Timeline(
 }
 
 private val RULER = Dimens.ruler
-private val SOUND_LANE = 40.dp
+private val SOUND_LANE = 42.dp
 private val HANDLE = 14.dp
 private val LANE_GAP = 6.dp
 
 private enum class Outcome { Tap, Pan, LongPress }
 
-private fun layoutLanes(view: ProjectView, height: Float, scrollY: Float?, density: androidx.compose.ui.unit.Density): LaneLayout =
-    with(density) {
-        val mainIndex = mainTrackIndex(view)
-        val gap = LANE_GAP.toPx()
-        val heights = view.tracks.indices.reversed().map { index ->
-            val track = view.tracks[index]
-            val used = view.clips.any { it.trackId == track.id }
-            val sound = view.clips.any { it.trackId == track.id && it.kind == ClipKind.Audio }
-            index to when {
-                index == mainIndex -> Dimens.mainTrack.toPx()
-                sound -> SOUND_LANE.toPx()
-                used -> Dimens.overlayLane.toPx()
-                else -> Dimens.emptyLane.toPx()
-            }
-        }
-        val total = heights.sumOf { it.second.toDouble() }.toFloat() + gap * max(0, heights.size - 1)
-        val available = height - RULER.toPx() - 16.dp.toPx()
-        var y = RULER.toPx() + 10.dp.toPx()
-        if (total <= available) {
-            y += (available - total) * 0.3f
-        } else {
-            val probe = LaneLayout(rowsFrom(view, heights, y, gap, mainIndex), gap)
-            y -= scrollY ?: autoScroll(probe, height, density)
-        }
-        LaneLayout(rowsFrom(view, heights, y, gap, mainIndex), gap)
+private fun layoutFeatureLanes(
+    view: ProjectView,
+    mainTrackId: String?,
+    height: Float,
+    scrollY: Float?,
+    density: Density,
+): LaneLayout = with(density) {
+    val gap = LANE_GAP.toPx()
+    val resolvedMainId = mainTrackId ?: view.tracks.firstOrNull()?.id.orEmpty()
+    val groupsPresent = view.clips.map { featureGroupOf(it, mainTrackId) }.toSet()
+    val hasMainMedia = view.clips.any { it.trackId == resolvedMainId }
+
+    val orderedGroups = buildList {
+        if (FeatureGroup.Effects in groupsPresent) add(FeatureGroup.Effects)
+        if (FeatureGroup.Sticker in groupsPresent) add(FeatureGroup.Sticker)
+        add(FeatureGroup.Text)
+        if (FeatureGroup.Overlay in groupsPresent) add(FeatureGroup.Overlay)
+        add(FeatureGroup.Main)
+        if (hasMainMedia || FeatureGroup.Audio in groupsPresent) add(FeatureGroup.Audio)
     }
 
-private fun rowsFrom(view: ProjectView, heights: List<Pair<Int, Float>>, startY: Float, gap: Float, mainIndex: Int): List<LaneRow> {
+    val heights = orderedGroups.map { group ->
+        val trackId = view.clips.firstOrNull { featureGroupOf(it, mainTrackId) == group }?.trackId ?: resolvedMainId
+        val h = when (group) {
+            FeatureGroup.Main -> Dimens.mainTrack.toPx()
+            FeatureGroup.Audio -> SOUND_LANE.toPx()
+            else -> Dimens.overlayLane.toPx()
+        }
+        Triple(group, trackId, h)
+    }
+
+    val total = heights.sumOf { it.third.toDouble() }.toFloat() + gap * max(0, heights.size - 1)
+    val available = height - RULER.toPx() - 16.dp.toPx()
+    var y = RULER.toPx() + 10.dp.toPx()
+    if (total <= available) {
+        y += (available - total) * 0.25f
+    } else {
+        val probe = LaneLayout(rowsFromGroups(heights, y, gap), gap)
+        y -= scrollY ?: autoScroll(probe, height, density)
+    }
+    LaneLayout(rowsFromGroups(heights, y, gap), gap)
+}
+
+private fun rowsFromGroups(heights: List<Triple<FeatureGroup, String, Float>>, startY: Float, gap: Float): List<FeatureLaneRow> {
     var y = startY
-    return heights.map { (index, h) ->
-        LaneRow(index, view.tracks[index].id, y, h, index == mainIndex).also { y += h + gap }
+    return heights.map { (group, trackId, h) ->
+        FeatureLaneRow(group, trackId, y, h).also { y += h + gap }
     }
 }
 
-private fun autoScroll(layout: LaneLayout, height: Float, density: androidx.compose.ui.unit.Density): Float = with(density) {
+private fun autoScroll(layout: LaneLayout, height: Float, density: Density): Float = with(density) {
     val main = layout.main ?: return 0f
     val overflow = max(0f, layout.bottom - layout.top - (height - RULER.toPx() - 16.dp.toPx()))
     (main.centre - height * 0.55f).coerceIn(0f, overflow)
@@ -551,7 +690,7 @@ private fun buttonAt(
     layout: LaneLayout,
     at: Offset,
     x: (Double) -> Float,
-    density: androidx.compose.ui.unit.Density,
+    density: Density,
 ): TimelineButton? = with(density) {
     val main = layout.main ?: return null
     val reach = 10.dp.toPx()
@@ -603,8 +742,14 @@ private fun trimRange(view: ProjectView, clip: Clip, edge: String): Pair<Double,
 
 private fun ruleStyle() = TextStyle(color = ConcatColors.fgDim, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum")
 
-/** Penggaris timeline di bagian atas dengan label waktu presisi milidetik (MM:SS.mmm) saat zoom masuk. */
-private fun DrawScope.drawRuler(measurer: TextMeasurer, position: Double, scale: Float, centre: Float) {
+private fun DrawScope.drawRuler(
+    textCache: TextLayoutCache,
+    reusablePath: Path,
+    position: Double,
+    scale: Float,
+    centre: Float,
+    markers: List<Double>,
+) {
     drawRect(ConcatColors.page, Offset.Zero, Size(size.width, RULER.toPx()))
     val step = when {
         scale > 1600.dp.toPx() -> 0.05
@@ -632,7 +777,7 @@ private fun DrawScope.drawRuler(measurer: TextMeasurer, position: Double, scale:
         } else {
             String.format(Locale.US, "%02d:%02d", seconds / 60, seconds % 60)
         }
-        val text = measurer.measure(formatted, label)
+        val text = textCache.measure(formatted, label)
         val x = at - text.size.width / 2f
         if (x >= 0f && x + text.size.width <= size.width && abs(at - centre) > text.size.width / 2f + 2.dp.toPx()) {
             drawText(text, topLeft = Offset(x, mid - text.size.height / 2f))
@@ -641,6 +786,62 @@ private fun DrawScope.drawRuler(measurer: TextMeasurer, position: Double, scale:
         if (half in 0f..size.width) drawCircle(ConcatColors.fgDim, 1.2.dp.toPx(), Offset(half, mid))
         tick += step
     }
+
+    // Gambar ikon berlian penanda irama (Beat Markers) di bagian bawah penggaris
+    val r = 4.5.dp.toPx()
+    val my = RULER.toPx() - 5.dp.toPx()
+    for (m in markers) {
+        val mx = centre + ((m - position) * scale).toFloat()
+        if (mx < -12f || mx > size.width + 12f) continue
+        reusablePath.reset()
+        reusablePath.moveTo(mx, my - r)
+        reusablePath.lineTo(mx + r, my)
+        reusablePath.lineTo(mx, my + r)
+        reusablePath.lineTo(mx - r, my)
+        reusablePath.close()
+        drawPath(reusablePath, COLOR_MARKER)
+    }
+}
+
+/** Label + ikon kategori fitur di sisi paling kiri tiap baris (di atas dan bawah posisi Cover). */
+private fun DrawScope.drawFeatureGutterBadge(
+    textCache: TextLayoutCache,
+    glyphs: TimelineGlyphs,
+    row: FeatureLaneRow,
+) {
+    val icon = when (row.group) {
+        FeatureGroup.Effects -> glyphs.sparkle
+        FeatureGroup.Sticker -> glyphs.shapes
+        FeatureGroup.Text -> glyphs.text
+        FeatureGroup.Overlay -> glyphs.image
+        FeatureGroup.Audio -> glyphs.music
+        FeatureGroup.Main -> glyphs.film
+    }
+    val style = TextStyle(color = ConcatColors.fgMuted, fontSize = 9.sp, fontFamily = Inter, fontWeight = FontWeight.Medium)
+    val laid = textCache.measure(row.group.label, style)
+    val iconSize = 11.dp.toPx()
+    val padX = 6.dp.toPx()
+    val padY = 3.dp.toPx()
+    val w = padX * 2 + iconSize + 4.dp.toPx() + laid.size.width
+    val h = max(iconSize, laid.size.height.toFloat()) + padY * 2
+    val left = 6.dp.toPx()
+    val top = row.centre - h / 2f
+
+    drawRoundRect(
+        color = ConcatColors.raised.copy(alpha = 0.90f),
+        topLeft = Offset(left, top),
+        size = Size(w, h),
+        cornerRadius = CornerRadius(6.dp.toPx()),
+    )
+    drawRoundRect(
+        color = ConcatColors.lineStrong.copy(alpha = 0.7f),
+        topLeft = Offset(left, top),
+        size = Size(w, h),
+        cornerRadius = CornerRadius(6.dp.toPx()),
+        style = Stroke(1.dp.toPx()),
+    )
+    glyph(icon, Offset(left + padX, top + (h - iconSize) / 2f), iconSize, ConcatColors.fg)
+    drawText(laid, topLeft = Offset(left + padX + iconSize + 4.dp.toPx(), top + (h - laid.size.height) / 2f))
 }
 
 private fun DrawScope.glyph(painter: VectorPainter, topLeft: Offset, size: Float, tint: Color) {
@@ -661,7 +862,8 @@ private fun kindGlyph(glyphs: TimelineGlyphs, clip: Clip): VectorPainter = when 
 }
 
 private fun DrawScope.drawClip(
-    measurer: TextMeasurer,
+    textCache: TextLayoutCache,
+    reusablePath: Path,
     glyphs: TimelineGlyphs,
     media: MediaCache,
     projectPath: String,
@@ -670,8 +872,9 @@ private fun DrawScope.drawClip(
     role: String?,
     left: Float,
     right: Float,
-    row: LaneRow,
+    row: FeatureLaneRow,
     alpha: Float,
+    stackedInset: Boolean = false,
 ) {
     if (right < 0 || left > size.width) return
     val kind = KindColors.of(clip.kind)
@@ -689,12 +892,17 @@ private fun DrawScope.drawClip(
     } else {
         Color.White
     }
-    val inset = if (row.main) 0f else 1.dp.toPx()
+    val inset = when {
+        row.main -> 0f
+        stackedInset -> 3.5.dp.toPx()
+        else -> 1.dp.toPx()
+    }
     val box = Rect(left + 1f, row.top + inset, max(left + 3f, right - 1f), row.bottom - inset)
     val corner = CornerRadius((if (row.main) 6 else 5).dp.toPx())
-    val shape = Path().apply { addRoundRect(RoundRect(box, corner)) }
+    reusablePath.reset()
+    reusablePath.addRoundRect(RoundRect(box, corner))
     val file = view.mediaOf(clip)?.path
-    clipPath(shape) {
+    clipPath(reusablePath) {
         when {
             (clip.kind == ClipKind.Video || clip.kind == ClipKind.Image) && file != null -> {
                 drawRect(kind.well.copy(alpha = alpha), box.topLeft, box.size)
@@ -713,6 +921,15 @@ private fun DrawScope.drawClip(
             }
         }
     }
+    if (stackedInset) {
+        drawRoundRect(
+            color = Color.Black.copy(alpha = 0.45f * alpha),
+            topLeft = box.topLeft,
+            size = box.size,
+            cornerRadius = corner,
+            style = Stroke(1.dp.toPx()),
+        )
+    }
 
     val width = box.width
     val glyphSize = 14.dp.toPx()
@@ -727,12 +944,10 @@ private fun DrawScope.drawClip(
         labelLeft += size + 4.dp.toPx()
         val room = (box.right - labelLeft - 6.dp.toPx()).toInt()
         if (room > 12.dp.toPx()) {
-            val laid = measurer.measure(
-                clip.name.ifBlank { clip.kind.name },
-                TextStyle(color = contentTint.copy(alpha = if (sound) 0.85f * alpha else alpha), fontSize = if (sound) 9.sp else 11.sp, fontFamily = Inter),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                constraints = Constraints(maxWidth = room),
+            val laid = textCache.measure(
+                text = clip.name.ifBlank { clip.kind.name },
+                style = TextStyle(color = contentTint.copy(alpha = if (sound) 0.85f * alpha else alpha), fontSize = if (sound) 9.sp else 11.sp, fontFamily = Inter),
+                maxWidth = room,
             )
             drawText(laid, topLeft = Offset(labelLeft, lineY - laid.size.height / 2f))
         }
@@ -741,7 +956,7 @@ private fun DrawScope.drawClip(
     var badgeX = box.left + 4.dp.toPx()
     val badgeY = box.top + 3.dp.toPx()
     if (row.main && abs(clip.speed - 1.0) > 1e-3 && width > 36.dp.toPx()) {
-        badgeX += drawBadge(measurer, "%.1fx".format(clip.speed), Offset(max(badgeX, 4.dp.toPx()), badgeY)) + 4.dp.toPx()
+        badgeX += drawBadge(textCache, "%.1fx".format(clip.speed), Offset(max(badgeX, 4.dp.toPx()), badgeY)) + 4.dp.toPx()
     }
     if (row.main && clip.muted && width > 28.dp.toPx()) {
         val s = 12.dp.toPx()
@@ -753,8 +968,8 @@ private fun DrawScope.drawClip(
     }
 }
 
-private fun DrawScope.drawBadge(measurer: TextMeasurer, text: String, at: Offset, background: Color = Color.Black.copy(alpha = 0.6f)): Float {
-    val laid = measurer.measure(text, TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum"))
+private fun DrawScope.drawBadge(textCache: TextLayoutCache, text: String, at: Offset, background: Color = Color.Black.copy(alpha = 0.6f)): Float {
+    val laid = textCache.measure(text, TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum"))
     val pad = 4.dp.toPx()
     val w = laid.size.width + pad * 2
     drawRoundRect(background, at, Size(w, laid.size.height + 2.dp.toPx()), CornerRadius(4.dp.toPx()))
@@ -800,7 +1015,7 @@ private fun DrawScope.drawWaveform(media: MediaCache, projectPath: String, file:
     val peaks = media.peaks(projectPath, file) ?: return
     if (peaks.max.isEmpty()) return
     val mid = box.center.y
-    val half = box.height * 0.42f
+    val half = box.height * 0.44f
     val step = 2.dp.toPx()
     val scale = box.width / clip.duration.coerceAtLeast(1e-6)
     var x = max(box.left, 0f)
@@ -811,13 +1026,21 @@ private fun DrawScope.drawWaveform(media: MediaCache, projectPath: String, file:
         if (i in peaks.max.indices) {
             val top = mid - peaks.max[i].coerceIn(0f, 1f) * half
             val bottom = mid - peaks.min.getOrElse(i) { -peaks.max[i] }.coerceIn(-1f, 0f) * half
-            drawLine(colour, Offset(x, top), Offset(x, max(bottom, top + 1f)), strokeWidth = step * 0.6f)
+            drawLine(colour, Offset(x, top), Offset(x, max(bottom, top + 1f)), strokeWidth = step * 0.65f)
         }
         x += step
     }
 }
 
-private fun DrawScope.drawSelection(measurer: TextMeasurer, clip: Clip, left: Float, right: Float, row: LaneRow, alpha: Float) {
+private fun DrawScope.drawSelection(
+    textCache: TextLayoutCache,
+    reusablePath: Path,
+    clip: Clip,
+    left: Float,
+    right: Float,
+    row: FeatureLaneRow,
+    alpha: Float,
+) {
     if (right < -HANDLE.toPx() || left > size.width + HANDLE.toPx()) return
     val stroke = 3.dp.toPx()
     val top = row.top - stroke / 2f
@@ -836,22 +1059,20 @@ private fun DrawScope.drawSelection(measurer: TextMeasurer, clip: Clip, left: Fl
     val grip = ConcatColors.page.copy(alpha = alpha)
     val height = bottom - top + stroke
     val y = top - stroke / 2f
-    val leftHandle = Path().apply {
-        addRoundRect(RoundRect(Rect(left - handle, y, left, y + height), topLeft = radius, bottomLeft = radius))
-    }
-    drawPath(leftHandle, white)
-    val rightHandle = Path().apply {
-        addRoundRect(RoundRect(Rect(right, y, right + handle, y + height), topRight = radius, bottomRight = radius))
-    }
-    drawPath(rightHandle, white)
+    reusablePath.reset()
+    reusablePath.addRoundRect(RoundRect(Rect(left - handle, y, left, y + height), topLeft = radius, bottomLeft = radius))
+    drawPath(reusablePath, white)
+    reusablePath.reset()
+    reusablePath.addRoundRect(RoundRect(Rect(right, y, right + handle, y + height), topRight = radius, bottomRight = radius))
+    drawPath(reusablePath, white)
     val gripHalf = min(8.dp.toPx(), height * 0.22f)
     val mid = row.centre
-    drawLine(grip, Offset(left - handle / 2f, mid - gripHalf), Offset(left - handle / 2f, mid + gripHalf), 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
-    drawLine(grip, Offset(right + handle / 2f, mid - gripHalf), Offset(right + handle / 2f, mid + gripHalf), 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+    drawLine(grip, Offset(left - handle / 2f, mid - gripHalf), Offset(left - handle / 2f, mid + gripHalf), 2.dp.toPx(), cap = StrokeCap.Round)
+    drawLine(grip, Offset(right + handle / 2f, mid - gripHalf), Offset(right + handle / 2f, mid + gripHalf), 2.dp.toPx(), cap = StrokeCap.Round)
 
     if (right - left > 34.dp.toPx()) {
         val durLabel = String.format(Locale.US, "%.3fs", clip.duration)
-        val laid = measurer.measure(durLabel, TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum"))
+        val laid = textCache.measure(durLabel, TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum"))
         val pad = 4.dp.toPx()
         val bx = max(left + 4.dp.toPx(), 4.dp.toPx()).coerceAtMost(right - laid.size.width - pad * 2 - 4.dp.toPx())
         val by = row.bottom - laid.size.height - 5.dp.toPx()
@@ -863,11 +1084,12 @@ private fun DrawScope.drawSelection(measurer: TextMeasurer, clip: Clip, left: Fl
 }
 
 private fun DrawScope.drawMainExtras(
-    measurer: TextMeasurer,
+    textCache: TextLayoutCache,
+    reusablePath: Path,
     glyphs: TimelineGlyphs,
     media: MediaCache,
     view: ProjectView,
-    main: LaneRow,
+    main: FeatureLaneRow,
     selected: String?,
     cover: ImageBitmap?,
     x: (Double) -> Float,
@@ -879,8 +1101,9 @@ private fun DrawScope.drawMainExtras(
     val coverLeft = coverRight - side
     if (coverRight > 0) {
         val rect = Rect(coverLeft, main.top, coverRight, main.bottom)
-        val shape = Path().apply { addRoundRect(RoundRect(rect, CornerRadius(6.dp.toPx()))) }
-        clipPath(shape) {
+        reusablePath.reset()
+        reusablePath.addRoundRect(RoundRect(rect, CornerRadius(6.dp.toPx())))
+        clipPath(reusablePath) {
             drawRect(ConcatColors.raised, rect.topLeft, rect.size)
             val first = clips.firstOrNull { it.kind == ClipKind.Video || it.kind == ClipKind.Image }
             val file = first?.let { view.mediaOf(it)?.path }
@@ -896,7 +1119,7 @@ private fun DrawScope.drawMainExtras(
             drawRect(Color.Black.copy(alpha = 0.72f), Offset(rect.left, rect.bottom - 16.dp.toPx()), Size(rect.width, 16.dp.toPx()))
         }
         drawRoundRect(ConcatColors.lineStrong, rect.topLeft, rect.size, CornerRadius(6.dp.toPx()), style = Stroke(1.dp.toPx()))
-        val laid = measurer.measure("Cover", TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter))
+        val laid = textCache.measure("Cover", TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter))
         drawText(laid, topLeft = Offset(rect.center.x - laid.size.width / 2f, rect.bottom - 8.dp.toPx() - laid.size.height / 2f))
 
         val videos = clips.filter { it.kind == ClipKind.Video }
@@ -908,7 +1131,7 @@ private fun DrawScope.drawMainExtras(
                 drawCircle(ConcatColors.raised, r, Offset(cx, main.centre - 6.dp.toPx()))
                 val g = 16.dp.toPx()
                 glyph(if (muted) glyphs.volumeOff else glyphs.volume, Offset(cx - g / 2, main.centre - 6.dp.toPx() - g / 2), g, if (muted) ConcatColors.fgMuted else ConcatColors.fg)
-                val label = measurer.measure(if (muted) "Muted" else "Sound", TextStyle(color = ConcatColors.fgMuted, fontSize = 8.sp, fontFamily = Inter))
+                val label = textCache.measure(if (muted) "Muted" else "Sound", TextStyle(color = ConcatColors.fgMuted, fontSize = 8.sp, fontFamily = Inter))
                 drawText(label, topLeft = Offset(cx - label.size.width / 2f, main.centre + r - 4.dp.toPx()))
             }
         }
@@ -943,7 +1166,7 @@ private fun DrawScope.drawMainExtras(
         val g = 22.dp.toPx()
         glyph(glyphs.plus, Offset(plusLeft + (s - g) / 2, main.centre - g / 2), g, ConcatColors.page)
         if (clips.isEmpty()) {
-            val hint = measurer.measure("Add media", TextStyle(color = ConcatColors.fgMuted, fontSize = 13.sp, fontFamily = Inter))
+            val hint = textCache.measure("Add media", TextStyle(color = ConcatColors.fgMuted, fontSize = 13.sp, fontFamily = Inter))
             val hx = plusLeft + s + 10.dp.toPx()
             if (hx + hint.size.width <= size.width) drawText(hint, topLeft = Offset(hx, main.centre - hint.size.height / 2f))
         }
