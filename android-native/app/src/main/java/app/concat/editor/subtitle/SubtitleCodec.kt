@@ -22,6 +22,10 @@ data class SubtitleCue(
 
 object SubtitleCodec {
 
+    /** Posisi vertikal default subtitle di tengah bawah layar (0.5 + 0.36 = 0.86 tinggi frame). */
+    const val DEFAULT_SUBTITLE_OFFSET_X = 0.0
+    const val DEFAULT_SUBTITLE_OFFSET_Y = 0.36
+
     private data class AssStyle(
         val fontName: String = "Hanken Grotesk",
         val fontSize: Double = 48.0,
@@ -155,7 +159,6 @@ object SubtitleCodec {
                         val base = styles[styleName] ?: styles["Default"] ?: AssStyle()
                         val rawDialogue = col("text") ?: continue
 
-                        // Ekstrak override tag sederhana ({\c&H...&}, {\bord...}, {\shad...}, {\b1}, {\i1})
                         var color = base.primaryColor
                         var outlineColor = base.outlineColor
                         var outlinePx = base.outline
