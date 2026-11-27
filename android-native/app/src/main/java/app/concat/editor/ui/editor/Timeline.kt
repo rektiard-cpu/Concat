@@ -59,12 +59,12 @@ import app.concat.editor.api.ProjectView
 import app.concat.editor.media.MediaCache
 import app.concat.editor.media.StripKey
 import app.concat.editor.ui.icons.ConcatIcons
-import app.concat.editor.ui.secondsLabel
 import app.concat.editor.ui.theme.ConcatColors
 import app.concat.editor.ui.theme.Dimens
 import app.concat.editor.ui.theme.Inter
 import app.concat.editor.ui.theme.KindColors
 import app.concat.editor.ui.theme.Motion
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -110,6 +110,10 @@ private class LaneLayout(val rows: List<LaneRow>, val gap: Float) {
 
 private const val MIN_LENGTH = 1.0 / 60
 
+private val COLOR_TEXT_IMPORTED = Color(0xFF2563EB)   // Biru: hasil import SRT/ASS
+private val COLOR_TEXT_DEFAULT = Color(0xFFEC4899)    // Pink: teks default / add text biasa
+private val COLOR_TEXT_DUPLICATE = Color(0xFFEAB308)  // Kuning: teks duplikat
+
 fun mainTrackIndex(view: ProjectView): Int {
     val pictures = view.clips.filter { it.kind == ClipKind.Video || it.kind == ClipKind.Image }.map { it.trackId }.toSet()
     return view.tracks.indexOfFirst { it.id in pictures }.takeIf { it >= 0 } ?: 0
@@ -136,6 +140,7 @@ fun Timeline(
     media: MediaCache,
     position: Double,
     selected: String?,
+    clipRoles: Map<String, String> = emptyMap(),
     onScrub: (Double) -> Unit,
     onSelect: (String?) -> Unit,
     onMove: (clipId: String, start: Double, target: LaneTarget) -> Unit,
@@ -383,7 +388,7 @@ fun Timeline(
                             if (event.changes.none { it.pressed }) break
                             if (event.changes.count { it.pressed } > 1) pinched = true
                             val zoom = event.calculateZoom()
-                            if (zoom != 1f) pxPerSecond = (scaleNow() * zoom).coerceIn(8.dp.toPx(), 2400.dp.toPx())
+                            if (zoom != 1f) pxPerSecond = (scaleNow() * zoom).coerceIn(8.dp.toPx(), 3200.dp.toPx())
                             val pan = event.calculatePan()
                             if (pan.x != 0f) {
                                 at = (at - pan.x / scaleNow()).coerceIn(0.0, currentView.duration)
@@ -435,7 +440,7 @@ fun Timeline(
                     if (clip.trackId != row.trackId) continue
                     val beingMoved = moving?.clipId == clip.id
                     drawClip(
-                        measurer, glyphs, media, projectPath, view, clip, x(clip.start), x(clip.end), row,
+                        measurer, glyphs, media, projectPath, view, clip, clipRoles[clip.id], x(clip.start), x(clip.end), row,
                         alpha = if (beingMoved) 0.3f else 1f,
                     )
                 }
@@ -467,7 +472,7 @@ fun Timeline(
                     }
                     val left = x(moving.start)
                     val right = x(moving.start + moving.duration)
-                    drawClip(measurer, glyphs, media, projectPath, view, clip, left, right, row, alpha = 0.92f)
+                    drawClip(measurer, glyphs, media, projectPath, view, clip, clipRoles[clip.id], left, right, row, alpha = 0.92f)
                     drawSelection(measurer, clip.copy(start = moving.start, duration = moving.duration), left, right, row, 1f)
                 }
                 moving.snappedAt?.let { at ->
@@ -598,19 +603,20 @@ private fun trimRange(view: ProjectView, clip: Clip, edge: String): Pair<Double,
 
 private fun ruleStyle() = TextStyle(color = ConcatColors.fgDim, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum")
 
-/** Time along the top: a labelled tick every so often (down to 0.1s when zoomed in) and dots between. */
+/** Penggaris timeline di bagian atas dengan label waktu presisi milidetik (MM:SS.mmm) saat zoom masuk. */
 private fun DrawScope.drawRuler(measurer: TextMeasurer, position: Double, scale: Float, centre: Float) {
     drawRect(ConcatColors.page, Offset.Zero, Size(size.width, RULER.toPx()))
     val step = when {
+        scale > 1600.dp.toPx() -> 0.05
         scale > 900.dp.toPx() -> 0.1
-        scale > 450.dp.toPx() -> 0.2
+        scale > 450.dp.toPx() -> 0.25
         scale > 200.dp.toPx() -> 0.5
         scale > 90.dp.toPx() -> 1.0
         scale > 40.dp.toPx() -> 2.0
         scale > 15.dp.toPx() -> 5.0
         else -> 10.0
     }
-    val subSecond = step < 1.0
+    val showMillis = step <= 1.0
     val first = floor((position - centre / scale) / step) * step
     val last = ceil((position + centre / scale) / step) * step
     var tick = max(0.0, first)
@@ -618,13 +624,13 @@ private fun DrawScope.drawRuler(measurer: TextMeasurer, position: Double, scale:
     val mid = 8.dp.toPx()
     while (tick <= last) {
         val at = centre + ((tick - position) * scale).toFloat()
-        val totalTenths = (tick * 10.0).roundToInt()
-        val seconds = totalTenths / 10L
-        val tenths = (totalTenths % 10).toInt()
-        val formatted = if (subSecond) {
-            "%02d:%02d.%d".format(seconds / 60, seconds % 60, tenths)
+        val totalMs = (tick * 1000.0).roundToInt().toLong()
+        val seconds = totalMs / 1000L
+        val millis = (totalMs % 1000L).toInt()
+        val formatted = if (showMillis) {
+            String.format(Locale.US, "%02d:%02d.%03d", seconds / 60, seconds % 60, millis)
         } else {
-            "%02d:%02d".format(seconds / 60, seconds % 60)
+            String.format(Locale.US, "%02d:%02d", seconds / 60, seconds % 60)
         }
         val text = measurer.measure(formatted, label)
         val x = at - text.size.width / 2f
@@ -661,6 +667,7 @@ private fun DrawScope.drawClip(
     projectPath: String,
     view: ProjectView,
     clip: Clip,
+    role: String?,
     left: Float,
     right: Float,
     row: LaneRow,
@@ -668,6 +675,20 @@ private fun DrawScope.drawClip(
 ) {
     if (right < 0 || left > size.width) return
     val kind = KindColors.of(clip.kind)
+    val boxColor = if (clip.kind == ClipKind.Text) {
+        when (role) {
+            EditorViewModel.ROLE_IMPORTED -> COLOR_TEXT_IMPORTED
+            EditorViewModel.ROLE_DUPLICATE -> COLOR_TEXT_DUPLICATE
+            else -> COLOR_TEXT_DEFAULT
+        }
+    } else {
+        kind.color
+    }
+    val contentTint = if (clip.kind == ClipKind.Text && role == EditorViewModel.ROLE_DUPLICATE) {
+        Color(0xFF18181B)
+    } else {
+        Color.White
+    }
     val inset = if (row.main) 0f else 1.dp.toPx()
     val box = Rect(left + 1f, row.top + inset, max(left + 3f, right - 1f), row.bottom - inset)
     val corner = CornerRadius((if (row.main) 6 else 5).dp.toPx())
@@ -688,7 +709,7 @@ private fun DrawScope.drawClip(
                 drawWaveform(media, projectPath, file, clip, wave, kind.color.copy(alpha = alpha))
             }
             else -> {
-                drawRect(kind.color.copy(alpha = 0.92f * alpha), box.topLeft, box.size)
+                drawRect(boxColor.copy(alpha = 0.94f * alpha), box.topLeft, box.size)
             }
         }
     }
@@ -702,13 +723,13 @@ private fun DrawScope.drawClip(
         val size = if (sound) 10.dp.toPx() else glyphSize
         val lineY = if (sound) box.top + 7.dp.toPx() else row.centre
         labelLeft = clipLeftOnScreen + 6.dp.toPx()
-        glyph(kindGlyph(glyphs, clip), Offset(labelLeft, lineY - size / 2f), size, Color.White.copy(alpha = alpha))
+        glyph(kindGlyph(glyphs, clip), Offset(labelLeft, lineY - size / 2f), size, contentTint.copy(alpha = alpha))
         labelLeft += size + 4.dp.toPx()
         val room = (box.right - labelLeft - 6.dp.toPx()).toInt()
         if (room > 12.dp.toPx()) {
             val laid = measurer.measure(
                 clip.name.ifBlank { clip.kind.name },
-                TextStyle(color = Color.White.copy(alpha = if (sound) 0.85f * alpha else alpha), fontSize = if (sound) 9.sp else 11.sp, fontFamily = Inter),
+                TextStyle(color = contentTint.copy(alpha = if (sound) 0.85f * alpha else alpha), fontSize = if (sound) 9.sp else 11.sp, fontFamily = Inter),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 constraints = Constraints(maxWidth = room),
@@ -829,7 +850,8 @@ private fun DrawScope.drawSelection(measurer: TextMeasurer, clip: Clip, left: Fl
     drawLine(grip, Offset(right + handle / 2f, mid - gripHalf), Offset(right + handle / 2f, mid + gripHalf), 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
 
     if (right - left > 34.dp.toPx()) {
-        val laid = measurer.measure(secondsLabel(clip.duration), TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum"))
+        val durLabel = String.format(Locale.US, "%.3fs", clip.duration)
+        val laid = measurer.measure(durLabel, TextStyle(color = Color.White, fontSize = 9.sp, fontFamily = Inter, fontFeatureSettings = "tnum"))
         val pad = 4.dp.toPx()
         val bx = max(left + 4.dp.toPx(), 4.dp.toPx()).coerceAtMost(right - laid.size.width - pad * 2 - 4.dp.toPx())
         val by = row.bottom - laid.size.height - 5.dp.toPx()
