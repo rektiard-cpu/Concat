@@ -118,6 +118,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
     private val seeks = Channel<Double>(Channel.CONFLATED)
     @Volatile private var scrubbedAt = 0L
     private var closed = false
+    private var transformPreviewActive = false
 
     init {
         viewModelScope.launch {
@@ -424,6 +425,25 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
 
     private val liveChains = Channel<Triple<String, String, List<JSONObject>>>(Channel.CONFLATED)
     private val liveText = Channel<Pair<String, JSONObject>>(Channel.CONFLATED)
+    private val liveTransforms = Channel<Pair<String, Placement>>(Channel.CONFLATED)
+
+    private fun buildTransformCommand(clipId: String, scale: Double, offsetX: Double, offsetY: Double, rotation: Double): JSONObject {
+        val roles = _ui.value.clipRoles
+        val isImported = roles[clipId] == ROLE_IMPORTED
+        val targets = if (isImported) {
+            _ui.value.view?.clips
+                ?.filter { it.kind == ClipKind.Text && roles[it.id] == ROLE_IMPORTED }
+                ?.map { it.id }
+                .orEmpty()
+        } else {
+            listOf(clipId)
+        }
+        return if (targets.size <= 1) {
+            Commands.setClipTransform(clipId, scale, offsetX, offsetY, rotation)
+        } else {
+            Commands.batch(targets.map { id -> Commands.setClipTransform(id, scale, offsetX, offsetY, rotation) })
+        }
+    }
 
     init {
         viewModelScope.launch {
@@ -466,6 +486,30 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                 }
             }
         }
+        viewModelScope.launch {
+            for ((clipId, p) in liveTransforms) {
+                edits.withLock {
+                    try {
+                        if (transformPreviewActive) {
+                            runCatching { api.undo(path) }
+                        }
+                        val cmd = buildTransformCommand(clipId, p.scale, p.offsetX, p.offsetY, p.rotation)
+                        val view = apply(cmd)
+                        transformPreviewActive = true
+                        withContext(Dispatchers.IO) { preview?.refresh() }
+                        _ui.update { it.copy(view = view) }
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        Log.w(TAG, "live transform failed", error)
+                    }
+                }
+            }
+        }
+    }
+
+    fun previewTransform(clipId: String, placement: Placement) {
+        liveTransforms.trySend(clipId to placement)
     }
 
     fun previewText(clipId: String, style: JSONObject) {
@@ -663,21 +707,11 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
 
     fun setTransform(clipId: String, scale: Double, offsetX: Double, offsetY: Double, rotation: Double) {
         change("Move") {
-            val roles = _ui.value.clipRoles
-            val isImported = roles[clipId] == ROLE_IMPORTED
-            val targets = if (isImported) {
-                _ui.value.view?.clips
-                    ?.filter { it.kind == ClipKind.Text && roles[it.id] == ROLE_IMPORTED }
-                    ?.map { it.id }
-                    .orEmpty()
-            } else {
-                listOf(clipId)
+            if (transformPreviewActive) {
+                runCatching { api.undo(path) }
+                transformPreviewActive = false
             }
-            if (targets.size <= 1) {
-                apply(Commands.setClipTransform(clipId, scale, offsetX, offsetY, rotation))
-            } else {
-                apply(Commands.batch(targets.map { id -> Commands.setClipTransform(id, scale, offsetX, offsetY, rotation) }))
-            }
+            apply(buildTransformCommand(clipId, scale, offsetX, offsetY, rotation))
         }
     }
 
@@ -805,7 +839,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                     parseCustomFont(dest)
                 }
                 _ui.update { it.copy(customFonts = scanCustomFonts()) }
-                say("Font \"${imported.label}\" ditambahkan. Tutup & buka ulang aplikasi jika font baru belum tampil di preview.")
+                say("Font \"${imported.label}\" ditambahkan dan siap dipakai.")
             } catch (error: Exception) {
                 Log.w(TAG, "import font failed", error)
                 say(error.message ?: "Gagal mengimpor font.")
@@ -842,11 +876,6 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
             .orEmpty()
     }
 
-    /**
-     * Membaca tabel OpenType `name` untuk mengekstrak:
-     * - Typographic Family (nameId=16, mis. "Satoshi" untuk fontdb Rust)
-     * - Subfamily / Style (nameId=17 / nameId=2, mis. "Black", "Bold", "Italic")
-     */
     private fun parseCustomFont(file: File): CustomFont {
         var typographicFamily: String? = null
         var legacyFamily: String? = null
@@ -888,11 +917,12 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                                     raf.seek(strPos)
                                     val buf = ByteArray(length)
                                     raf.readFully(buf)
-                                    val decoded = if (platformId == 3 || platformId == 0 || encodingId == 1) {
-                                        String(buf, StandardCharsets.UTF_16BE).trim()
+                                    val rawDecoded = if (platformId == 3 || platformId == 0 || encodingId == 1) {
+                                        String(buf, StandardCharsets.UTF_16BE)
                                     } else {
-                                        String(buf, StandardCharsets.UTF_8).trim()
+                                        String(buf, StandardCharsets.ISO_8859_1)
                                     }
+                                    val decoded = rawDecoded.replace("\u0000", "").trim()
                                     if (decoded.isNotBlank()) {
                                         when (nameId) {
                                             16 -> if (platformId == 3 || typographicFamily == null) typographicFamily = decoded
