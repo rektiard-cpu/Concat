@@ -105,6 +105,9 @@ private data class DragPreview(
 private class FeatureLaneRow(
     val group: FeatureGroup,
     val trackId: String,
+    val subLane: Int,
+    val subLaneCount: Int,
+    val expanded: Boolean,
     val top: Float,
     val height: Float,
 ) {
@@ -113,7 +116,12 @@ private class FeatureLaneRow(
     val main get() = group == FeatureGroup.Main
 }
 
-private class LaneLayout(val rows: List<FeatureLaneRow>, val gap: Float) {
+private class LaneLayout(
+    val rows: List<FeatureLaneRow>,
+    val clipSubLane: Map<String, Int>,
+    val gap: Float,
+    val contentHeight: Float,
+) {
     val top get() = rows.firstOrNull()?.top ?: 0f
     val bottom get() = rows.lastOrNull()?.bottom ?: 0f
     val main get() = rows.firstOrNull { it.main }
@@ -125,7 +133,17 @@ private class LaneLayout(val rows: List<FeatureLaneRow>, val gap: Float) {
         return rows.size - 1
     }
 
-    fun rowOfGroup(group: FeatureGroup) = rows.indexOfFirst { it.group == group }
+    fun rowForClip(clip: Clip, mainTrackId: String?): FeatureLaneRow? {
+        val group = featureGroupOf(clip, mainTrackId)
+        val sub = clipSubLane[clip.id] ?: 0
+        return rows.firstOrNull { it.group == group && it.subLane == sub }
+            ?: rows.firstOrNull { it.group == group }
+    }
+
+    fun rowIndexForClip(clip: Clip, mainTrackId: String?): Int {
+        val target = rowForClip(clip, mainTrackId) ?: return 0
+        return rows.indexOf(target).coerceAtLeast(0)
+    }
 }
 
 private const val MIN_LENGTH = 1.0 / 60
@@ -287,9 +305,12 @@ fun Timeline(
                     try {
                         val view = currentView
                         val mainTrackId = view.tracks.getOrNull(mainTrackIndex(view))?.id
+                        val expandedGroup = view.clip(currentSelected)
+                            ?.let { featureGroupOf(it, mainTrackId) }
+                            ?.takeIf { it != FeatureGroup.Main }
                         val scale = scaleNow()
                         val playhead = currentPosition
-                        val layout = layoutFeatureLanes(view, mainTrackId, size.height.toFloat(), scrollY, this)
+                        val layout = layoutFeatureLanes(view, mainTrackId, expandedGroup, size.height.toFloat(), scrollY, this)
                         val centre = size.width / 2f
                         fun timeAt(x: Float) = playhead + (x - centre) / scale
                         fun xOf(t: Double) = centre + ((t - playhead) * scale).toFloat()
@@ -297,11 +318,12 @@ fun Timeline(
                         val downRow = layout.rows.getOrNull(downRowIndex)
                         val downTime = timeAt(down.position.x)
 
-                        // Deteksi klip yang diketuk di baris fitur tersebut (mendukung cycling jika teks bertumpuk)
+                        // Deteksi klip pada baris atau sub-baris yang diketuk
                         val matchingClips = if (downRow != null && down.position.y >= downRow.top && down.position.y <= downRow.bottom) {
                             view.clips.filter { clip ->
-                                featureGroupOf(clip, mainTrackId) == downRow.group &&
-                                    downTime >= clip.start && downTime < clip.end
+                                val sameGroup = featureGroupOf(clip, mainTrackId) == downRow.group
+                                val sameSub = if (downRow.expanded) (layout.clipSubLane[clip.id] ?: 0) == downRow.subLane else true
+                                sameGroup && sameSub && downTime >= clip.start && downTime < clip.end
                             }
                         } else {
                             emptyList()
@@ -317,8 +339,7 @@ fun Timeline(
 
                         val chosen = view.clip(currentSelected)
                         val edge = chosen?.let { clip ->
-                            val group = featureGroupOf(clip, mainTrackId)
-                            val row = layout.rows.getOrNull(layout.rowOfGroup(group)) ?: return@let null
+                            val row = layout.rowForClip(clip, mainTrackId) ?: return@let null
                             val inLane = down.position.y >= row.top - 6f && down.position.y <= row.bottom + 6f
                             val left = xOf(clip.start)
                             val right = xOf(clip.end)
@@ -332,7 +353,7 @@ fun Timeline(
                         }
                         if (chosen != null && edge != null) {
                             down.consume()
-                            val row = layout.rowOfGroup(featureGroupOf(chosen, mainTrackId))
+                            val row = layout.rowIndexForClip(chosen, mainTrackId)
                             val (low, high) = trimRange(view, chosen, edge)
                             var delta = 0.0
                             var lastSnap: Double? = null
@@ -381,7 +402,7 @@ fun Timeline(
                                 val moved = change.position - down.position
                                 if (moved.getDistance() > slop) {
                                     outcome = Outcome.Pan
-                                    vertical = abs(moved.y) > abs(moved.x) * 1.4f
+                                    vertical = abs(moved.y) > abs(moved.x) * 0.85f
                                     break
                                 }
                             }
@@ -395,10 +416,10 @@ fun Timeline(
                                 is TimelineButton.Mute -> muteTrack(tapped.trackId, tapped.mute)
                                 TimelineButton.Cover -> openCover()
                                 null -> {
-                                    if (matchingClips.size > 1 && hit != null) {
+                                    if (hit != null) {
                                         choose(hit.id)
                                     } else {
-                                        choose(if (hit?.id == currentSelected) null else hit?.id)
+                                        choose(null)
                                     }
                                 }
                             }
@@ -410,7 +431,7 @@ fun Timeline(
                             choose(hit.id)
                             val grab = downTime - hit.start
                             var start = hit.start
-                            val row = layout.rowOfGroup(featureGroupOf(hit, mainTrackId))
+                            val row = layout.rowIndexForClip(hit, mainTrackId)
                             var lastSnap: Double? = null
                             drag = DragPreview(hit.id, start, hit.duration, row, null)
                             while (true) {
@@ -437,8 +458,9 @@ fun Timeline(
                         }
 
                         if (vertical) {
-                            val overflow = max(0f, layout.bottom - layout.top - (size.height - RULER.toPx() - 16.dp.toPx()))
-                            var offset = scrollY ?: autoScroll(layout, size.height.toFloat(), this)
+                            val viewportH = (size.height - RULER.toPx() - 12.dp.toPx()).coerceAtLeast(1f)
+                            val overflow = max(0f, layout.contentHeight - viewportH)
+                            var offset = (scrollY ?: autoScroll(layout, size.height.toFloat(), this)).coerceIn(0f, overflow)
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
@@ -490,7 +512,10 @@ fun Timeline(
         val scale = if (pxPerSecond <= 0f) 64.dp.toPx() else pxPerSecond
         val centre = size.width / 2f
         val mainTrackId = view.tracks.getOrNull(mainTrackIndex(view))?.id
-        val layout = layoutFeatureLanes(view, mainTrackId, size.height, scrollY, this)
+        val expandedGroup = view.clip(selected)
+            ?.let { featureGroupOf(it, mainTrackId) }
+            ?.takeIf { it != FeatureGroup.Main }
+        val layout = layoutFeatureLanes(view, mainTrackId, expandedGroup, size.height, scrollY, this)
         fun x(seconds: Double) = centre + ((seconds - position) * scale).toFloat()
         val leftVisibleTime = position - (centre + 40.dp.toPx()) / scale
         val rightVisibleTime = position + (centre + 40.dp.toPx()) / scale
@@ -501,18 +526,42 @@ fun Timeline(
         val moving = drag
 
         clipRect(top = RULER.toPx()) {
-            for (row in layout.rows) {
+            // 1. Gambar wadah grup fitur (menyatu untuk semua sub-baris saat grup sedang expanded)
+            val groupedRows = layout.rows.groupBy { it.group }
+            val badgeRightByGroup = HashMap<FeatureGroup, Float>(groupedRows.size)
+
+            for ((group, rowsInGroup) in groupedRows) {
+                val firstRow = rowsInGroup.first()
+                val lastRow = rowsInGroup.last()
+                val isExpanded = firstRow.expanded && rowsInGroup.size > 1
+                val bgColor = when {
+                    firstRow.main -> ConcatColors.well
+                    isExpanded -> ConcatColors.raised.copy(alpha = 0.55f)
+                    else -> ConcatColors.launchPanel.copy(alpha = 0.6f)
+                }
                 drawRect(
-                    if (row.main) ConcatColors.well else ConcatColors.launchPanel.copy(alpha = 0.6f),
-                    Offset(0f, row.top),
-                    Size(size.width, row.height),
+                    color = bgColor,
+                    topLeft = Offset(0f, firstRow.top),
+                    size = Size(size.width, lastRow.bottom - firstRow.top),
                 )
+                if (isExpanded) {
+                    drawRect(
+                        color = ConcatColors.accent,
+                        topLeft = Offset(0f, firstRow.top),
+                        size = Size(3.dp.toPx(), lastRow.bottom - firstRow.top),
+                    )
+                }
+                if (!firstRow.main) {
+                    val badgeW = measureFeatureBadgeWidth(textCache, group, rowsInGroup.size, isExpanded)
+                    badgeRightByGroup[group] = 6.dp.toPx() + badgeW + 6.dp.toPx()
+                }
             }
 
-            // 1. Gambar klip tiap baris fitur (dengan viewport culling agar 60fps tanpa lag)
+            // 2. Gambar klip tiap baris / sub-baris fitur
             for (row in layout.rows) {
-                if (row.group == FeatureGroup.Audio) {
-                    // Gambar gelombang audio dari video utama di baris paling bawah
+                val safeLeftForLabel = badgeRightByGroup[row.group] ?: 0f
+
+                if (row.group == FeatureGroup.Audio && row.subLane == 0) {
                     for (clip in view.clips) {
                         if (clip.trackId != mainTrackId || clip.kind != ClipKind.Video) continue
                         if (clip.end < leftVisibleTime || clip.start > rightVisibleTime) continue
@@ -525,9 +574,10 @@ fun Timeline(
 
                 val laneClips = view.clips.filter { clip ->
                     featureGroupOf(clip, mainTrackId) == row.group &&
+                        (!row.expanded || (layout.clipSubLane[clip.id] ?: 0) == row.subLane) &&
                         clip.end >= leftVisibleTime && clip.start <= rightVisibleTime
                 }
-                val orderedClips = if (row.group == FeatureGroup.Text) {
+                val orderedClips = if (!row.expanded && row.group == FeatureGroup.Text) {
                     laneClips.sortedWith(
                         compareBy<Clip> { it.id == selected }
                             .thenBy { clipRoles[it.id] != EditorViewModel.ROLE_IMPORTED }
@@ -539,9 +589,6 @@ fun Timeline(
 
                 for (clip in orderedClips) {
                     val beingMoved = moving?.clipId == clip.id
-                    val hasOverlap = row.group == FeatureGroup.Text &&
-                        clipRoles[clip.id] != EditorViewModel.ROLE_IMPORTED &&
-                        orderedClips.any { other -> other.id != clip.id && other.start < clip.end && other.end > clip.start }
                     drawClip(
                         textCache = textCache,
                         reusablePath = reusablePath,
@@ -555,21 +602,23 @@ fun Timeline(
                         right = x(clip.end),
                         row = row,
                         alpha = if (beingMoved) 0.3f else 1f,
-                        stackedInset = hasOverlap,
+                        minSafeLabelLeft = safeLeftForLabel,
                     )
                 }
             }
 
             if (main != null) drawMainExtras(textCache, reusablePath, glyphs, media, view, main, selected, cover, ::x)
 
-            // 2. Gambar label/ikon fitur di bilah paling kiri (di atas dan di bawah Cover)
-            for (row in layout.rows) {
-                if (!row.main) {
-                    drawFeatureGutterBadge(textCache, glyphs, row)
+            // 3. Gambar label/ikon fitur di bilah paling kiri tiap grup
+            for ((group, rowsInGroup) in groupedRows) {
+                val firstRow = rowsInGroup.first()
+                if (!firstRow.main) {
+                    val isExpanded = firstRow.expanded && rowsInGroup.size > 1
+                    drawFeatureGutterBadge(textCache, glyphs, group, firstRow, rowsInGroup.size, isExpanded)
                 }
             }
 
-            // 3. Gambar garis vertikal penanda irama (Beat Markers)
+            // 4. Gambar garis vertikal penanda irama (Beat Markers)
             for (m in markers) {
                 if (m < leftVisibleTime || m > rightVisibleTime) continue
                 val mx = x(m)
@@ -584,7 +633,7 @@ fun Timeline(
 
             val chosen = view.clip(selected)
             if (chosen != null && moving?.clipId != chosen.id) {
-                layout.rows.getOrNull(layout.rowOfGroup(featureGroupOf(chosen, mainTrackId)))?.let { row ->
+                layout.rowForClip(chosen, mainTrackId)?.let { row ->
                     drawSelection(textCache, reusablePath, chosen, x(chosen.start), x(chosen.end), row, selection.value)
                 }
             }
@@ -595,12 +644,30 @@ fun Timeline(
                     val row = layout.rows[moving.row]
                     val left = x(moving.start)
                     val right = x(moving.start + moving.duration)
-                    drawClip(textCache, reusablePath, glyphs, media, projectPath, view, clip, clipRoles[clip.id], left, right, row, alpha = 0.92f)
+                    val safeLeftForLabel = badgeRightByGroup[row.group] ?: 0f
+                    drawClip(textCache, reusablePath, glyphs, media, projectPath, view, clip, clipRoles[clip.id], left, right, row, alpha = 0.92f, minSafeLabelLeft = safeLeftForLabel)
                     drawSelection(textCache, reusablePath, clip.copy(start = moving.start, duration = moving.duration), left, right, row, 1f)
                 }
                 moving.snappedAt?.let { at ->
                     drawLine(ConcatColors.accent, Offset(x(at), RULER.toPx()), Offset(x(at), size.height), strokeWidth = 1.5.dp.toPx())
                 }
+            }
+
+            // 5. Indikator scrollbar vertikal di sisi kanan saat daftar track bisa digeser atas-bawah
+            val viewportH = (size.height - RULER.toPx() - 12.dp.toPx()).coerceAtLeast(1f)
+            val overflow = max(0f, layout.contentHeight - viewportH)
+            if (overflow > 1f) {
+                val currentOffset = (scrollY ?: autoScroll(layout, size.height, this)).coerceIn(0f, overflow)
+                val barTop = RULER.toPx() + 6.dp.toPx()
+                val trackH = (size.height - barTop - 6.dp.toPx()).coerceAtLeast(20f)
+                val thumbH = (trackH * (viewportH / layout.contentHeight)).coerceIn(24.dp.toPx(), trackH)
+                val thumbY = barTop + (trackH - thumbH) * (currentOffset / overflow)
+                drawRoundRect(
+                    color = ConcatColors.fgDim.copy(alpha = 0.65f),
+                    topLeft = Offset(size.width - 4.dp.toPx(), thumbY),
+                    size = Size(2.5.dp.toPx(), thumbH),
+                    cornerRadius = CornerRadius(2.dp.toPx()),
+                )
             }
         }
 
@@ -619,62 +686,130 @@ private val RULER = Dimens.ruler
 private val SOUND_LANE = 42.dp
 private val HANDLE = 14.dp
 private val LANE_GAP = 6.dp
+private val SUB_LANE_GAP = 4.dp
 
 private enum class Outcome { Tap, Pan, LongPress }
+
+private fun packSubLanes(clips: List<Clip>, startLane: Int = 0): Pair, Int> {
+    if (clips.isEmpty()) return emptyMap<String, Int>() to max(1, startLane)
+    val sorted = clips.sortedWith(compareBy<Clip> { it.start }.thenBy { it.id })
+    val laneEnds = ArrayList<Double>()
+    val result = HashMap<String, Int>(sorted.size)
+    for (clip in sorted) {
+        var assigned = -1
+        for (i in laneEnds.indices) {
+            if (laneEnds[i] <= clip.start + 1e-3) {
+                assigned = i
+                laneEnds[i] = max(laneEnds[i], clip.end)
+                break
+            }
+        }
+        if (assigned < 0) {
+            assigned = laneEnds.size
+            laneEnds.add(clip.end)
+        }
+        result[clip.id] = startLane + assigned
+    }
+    return result to (startLane + laneEnds.size)
+}
 
 private fun layoutFeatureLanes(
     view: ProjectView,
     mainTrackId: String?,
+    expandedGroup: FeatureGroup?,
     height: Float,
     scrollY: Float?,
     density: Density,
 ): LaneLayout = with(density) {
     val gap = LANE_GAP.toPx()
+    val subGap = SUB_LANE_GAP.toPx()
     val resolvedMainId = mainTrackId ?: view.tracks.firstOrNull()?.id.orEmpty()
-    val groupsPresent = view.clips.map { featureGroupOf(it, mainTrackId) }.toSet()
+    val clipsByGroup = view.clips.groupBy { featureGroupOf(it, mainTrackId) }
     val hasMainMedia = view.clips.any { it.trackId == resolvedMainId }
 
     val orderedGroups = buildList {
-        if (FeatureGroup.Effects in groupsPresent) add(FeatureGroup.Effects)
-        if (FeatureGroup.Sticker in groupsPresent) add(FeatureGroup.Sticker)
+        if (clipsByGroup[FeatureGroup.Effects]?.isNotEmpty() == true) add(FeatureGroup.Effects)
+        if (clipsByGroup[FeatureGroup.Sticker]?.isNotEmpty() == true) add(FeatureGroup.Sticker)
         add(FeatureGroup.Text)
-        if (FeatureGroup.Overlay in groupsPresent) add(FeatureGroup.Overlay)
+        if (clipsByGroup[FeatureGroup.Overlay]?.isNotEmpty() == true) add(FeatureGroup.Overlay)
         add(FeatureGroup.Main)
-        if (hasMainMedia || FeatureGroup.Audio in groupsPresent) add(FeatureGroup.Audio)
+        if (hasMainMedia || clipsByGroup[FeatureGroup.Audio]?.isNotEmpty() == true) add(FeatureGroup.Audio)
     }
 
-    val heights = orderedGroups.map { group ->
-        val trackId = view.clips.firstOrNull { featureGroupOf(it, mainTrackId) == group }?.trackId ?: resolvedMainId
-        val h = when (group) {
+    val clipSubLane = HashMap<String, Int>()
+    val specs = ArrayList<FeatureLaneRow>()
+    var cursorY = 0f
+
+    for ((groupIdx, group) in orderedGroups.withIndex()) {
+        if (groupIdx > 0) cursorY += gap
+        val groupClips = clipsByGroup[group].orEmpty()
+        val trackId = groupClips.firstOrNull()?.trackId ?: resolvedMainId
+        val isExpanded = group == expandedGroup && group != FeatureGroup.Main
+        val laneH = when (group) {
             FeatureGroup.Main -> Dimens.mainTrack.toPx()
             FeatureGroup.Audio -> SOUND_LANE.toPx()
             else -> Dimens.overlayLane.toPx()
         }
-        Triple(group, trackId, h)
+
+        val subLaneCount = if (isExpanded) {
+            val startLane = if (group == FeatureGroup.Audio && hasMainMedia) 1 else 0
+            val (assignments, count) = packSubLanes(groupClips, startLane)
+            clipSubLane.putAll(assignments)
+            count.coerceAtLeast(1)
+        } else {
+            groupClips.forEach { clipSubLane[it.id] = 0 }
+            1
+        }
+
+        for (sub in 0 until subLaneCount) {
+            if (sub > 0) cursorY += subGap
+            specs.add(
+                FeatureLaneRow(
+                    group = group,
+                    trackId = trackId,
+                    subLane = sub,
+                    subLaneCount = subLaneCount,
+                    expanded = isExpanded && subLaneCount > 1,
+                    top = cursorY,
+                    height = laneH,
+                ),
+            )
+            cursorY += laneH
+        }
     }
 
-    val total = heights.sumOf { it.third.toDouble() }.toFloat() + gap * max(0, heights.size - 1)
-    val available = height - RULER.toPx() - 16.dp.toPx()
-    var y = RULER.toPx() + 10.dp.toPx()
-    if (total <= available) {
-        y += (available - total) * 0.25f
+    val total = cursorY
+    val available = height - RULER.toPx() - 12.dp.toPx()
+    val startOffset = if (total <= available) {
+        RULER.toPx() + 8.dp.toPx() + (available - total) * 0.25f
     } else {
-        val probe = LaneLayout(rowsFromGroups(heights, y, gap), gap)
-        y -= scrollY ?: autoScroll(probe, height, density)
+        val probe = LaneLayout(specs.map { shiftRow(it, RULER.toPx() + 8.dp.toPx()) }, clipSubLane, gap, total)
+        val clampedScroll = (scrollY ?: autoScroll(probe, height, density)).coerceIn(0f, max(0f, total - available))
+        RULER.toPx() + 8.dp.toPx() - clampedScroll
     }
-    LaneLayout(rowsFromGroups(heights, y, gap), gap)
+
+    LaneLayout(
+        rows = specs.map { shiftRow(it, startOffset) },
+        clipSubLane = clipSubLane,
+        gap = gap,
+        contentHeight = total,
+    )
 }
 
-private fun rowsFromGroups(heights: List<Triple<FeatureGroup, String, Float>>, startY: Float, gap: Float): List<FeatureLaneRow> {
-    var y = startY
-    return heights.map { (group, trackId, h) ->
-        FeatureLaneRow(group, trackId, y, h).also { y += h + gap }
-    }
-}
+private fun shiftRow(row: FeatureLaneRow, dy: Float) = FeatureLaneRow(
+    group = row.group,
+    trackId = row.trackId,
+    subLane = row.subLane,
+    subLaneCount = row.subLaneCount,
+    expanded = row.expanded,
+    top = row.top + dy,
+    height = row.height,
+)
 
 private fun autoScroll(layout: LaneLayout, height: Float, density: Density): Float = with(density) {
     val main = layout.main ?: return 0f
-    val overflow = max(0f, layout.bottom - layout.top - (height - RULER.toPx() - 16.dp.toPx()))
+    val viewportH = max(1f, height - RULER.toPx() - 12.dp.toPx())
+    val overflow = max(0f, layout.contentHeight - viewportH)
     (main.centre - height * 0.55f).coerceIn(0f, overflow)
 }
 
@@ -787,7 +922,6 @@ private fun DrawScope.drawRuler(
         tick += step
     }
 
-    // Gambar ikon berlian penanda irama (Beat Markers) di bagian bawah penggaris
     val r = 4.5.dp.toPx()
     val my = RULER.toPx() - 5.dp.toPx()
     for (m in markers) {
@@ -803,13 +937,30 @@ private fun DrawScope.drawRuler(
     }
 }
 
-/** Label + ikon kategori fitur di sisi paling kiri tiap baris (di atas dan bawah posisi Cover). */
+private fun badgeTextFor(group: FeatureGroup, subLaneCount: Int, isExpanded: Boolean): String =
+    if (isExpanded && subLaneCount > 1) "${group.label} ($subLaneCount)" else group.label
+
+private fun DrawScope.measureFeatureBadgeWidth(
+    textCache: TextLayoutCache,
+    group: FeatureGroup,
+    subLaneCount: Int,
+    isExpanded: Boolean,
+): Float {
+    val style = TextStyle(color = ConcatColors.fgMuted, fontSize = 9.sp, fontFamily = Inter, fontWeight = FontWeight.Medium)
+    val laid = textCache.measure(badgeTextFor(group, subLaneCount, isExpanded), style)
+    return 6.dp.toPx() * 2 + 11.dp.toPx() + 4.dp.toPx() + laid.size.width
+}
+
+/** Label + ikon kategori fitur di sisi paling kiri tiap grup (di atas dan bawah posisi Cover). */
 private fun DrawScope.drawFeatureGutterBadge(
     textCache: TextLayoutCache,
     glyphs: TimelineGlyphs,
-    row: FeatureLaneRow,
+    group: FeatureGroup,
+    firstRow: FeatureLaneRow,
+    subLaneCount: Int,
+    isExpanded: Boolean,
 ) {
-    val icon = when (row.group) {
+    val icon = when (group) {
         FeatureGroup.Effects -> glyphs.sparkle
         FeatureGroup.Sticker -> glyphs.shapes
         FeatureGroup.Text -> glyphs.text
@@ -817,30 +968,31 @@ private fun DrawScope.drawFeatureGutterBadge(
         FeatureGroup.Audio -> glyphs.music
         FeatureGroup.Main -> glyphs.film
     }
-    val style = TextStyle(color = ConcatColors.fgMuted, fontSize = 9.sp, fontFamily = Inter, fontWeight = FontWeight.Medium)
-    val laid = textCache.measure(row.group.label, style)
+    val textColor = if (isExpanded) ConcatColors.accent else ConcatColors.fgMuted
+    val style = TextStyle(color = textColor, fontSize = 9.sp, fontFamily = Inter, fontWeight = FontWeight.Medium)
+    val laid = textCache.measure(badgeTextFor(group, subLaneCount, isExpanded), style)
     val iconSize = 11.dp.toPx()
     val padX = 6.dp.toPx()
     val padY = 3.dp.toPx()
     val w = padX * 2 + iconSize + 4.dp.toPx() + laid.size.width
     val h = max(iconSize, laid.size.height.toFloat()) + padY * 2
     val left = 6.dp.toPx()
-    val top = row.centre - h / 2f
+    val top = firstRow.centre - h / 2f
 
     drawRoundRect(
-        color = ConcatColors.raised.copy(alpha = 0.90f),
+        color = ConcatColors.raised.copy(alpha = 0.94f),
         topLeft = Offset(left, top),
         size = Size(w, h),
         cornerRadius = CornerRadius(6.dp.toPx()),
     )
     drawRoundRect(
-        color = ConcatColors.lineStrong.copy(alpha = 0.7f),
+        color = if (isExpanded) ConcatColors.accent.copy(alpha = 0.8f) else ConcatColors.lineStrong.copy(alpha = 0.7f),
         topLeft = Offset(left, top),
         size = Size(w, h),
         cornerRadius = CornerRadius(6.dp.toPx()),
         style = Stroke(1.dp.toPx()),
     )
-    glyph(icon, Offset(left + padX, top + (h - iconSize) / 2f), iconSize, ConcatColors.fg)
+    glyph(icon, Offset(left + padX, top + (h - iconSize) / 2f), iconSize, if (isExpanded) ConcatColors.accent else ConcatColors.fg)
     drawText(laid, topLeft = Offset(left + padX + iconSize + 4.dp.toPx(), top + (h - laid.size.height) / 2f))
 }
 
@@ -874,7 +1026,7 @@ private fun DrawScope.drawClip(
     right: Float,
     row: FeatureLaneRow,
     alpha: Float,
-    stackedInset: Boolean = false,
+    minSafeLabelLeft: Float = 0f,
 ) {
     if (right < 0 || left > size.width) return
     val kind = KindColors.of(clip.kind)
@@ -892,11 +1044,7 @@ private fun DrawScope.drawClip(
     } else {
         Color.White
     }
-    val inset = when {
-        row.main -> 0f
-        stackedInset -> 3.5.dp.toPx()
-        else -> 1.dp.toPx()
-    }
+    val inset = if (row.main) 0f else 1.dp.toPx()
     val box = Rect(left + 1f, row.top + inset, max(left + 3f, right - 1f), row.bottom - inset)
     val corner = CornerRadius((if (row.main) 6 else 5).dp.toPx())
     reusablePath.reset()
@@ -921,25 +1069,16 @@ private fun DrawScope.drawClip(
             }
         }
     }
-    if (stackedInset) {
-        drawRoundRect(
-            color = Color.Black.copy(alpha = 0.45f * alpha),
-            topLeft = box.topLeft,
-            size = box.size,
-            cornerRadius = corner,
-            style = Stroke(1.dp.toPx()),
-        )
-    }
 
     val width = box.width
     val glyphSize = 14.dp.toPx()
-    var labelLeft = box.left + 6.dp.toPx()
-    val clipLeftOnScreen = max(box.left, 0f)
-    if (!row.main && width > 22.dp.toPx()) {
+    val minScreenX = if (row.subLane == 0) minSafeLabelLeft else 6.dp.toPx()
+    val clipLeftOnScreen = max(box.left + 6.dp.toPx(), minScreenX)
+    if (!row.main && width > 22.dp.toPx() && clipLeftOnScreen + glyphSize < box.right - 4.dp.toPx()) {
         val sound = clip.kind == ClipKind.Audio
         val size = if (sound) 10.dp.toPx() else glyphSize
         val lineY = if (sound) box.top + 7.dp.toPx() else row.centre
-        labelLeft = clipLeftOnScreen + 6.dp.toPx()
+        var labelLeft = clipLeftOnScreen
         glyph(kindGlyph(glyphs, clip), Offset(labelLeft, lineY - size / 2f), size, contentTint.copy(alpha = alpha))
         labelLeft += size + 4.dp.toPx()
         val room = (box.right - labelLeft - 6.dp.toPx()).toInt()
