@@ -3,6 +3,9 @@
 
 package app.concat.editor
 
+import android.content.Context
+import android.content.SharedPreferences
+import android.content.pm.ActivityInfo
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -27,7 +30,17 @@ import kotlinx.coroutines.launch
 
 /** Three screens: the projects, the editor on one of them, and settings. */
 class MainActivity : ComponentActivity() {
+    private lateinit var prefs: SharedPreferences
+
+    private val orientationListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == KEY_AUTO_LANDSCAPE) applyOrientationPreference()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        applyOrientationPreference()
+        prefs.registerOnSharedPreferenceChangeListener(orientationListener)
+
         // Light bar icons over the dark theme, whatever the phone's own setting.
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
@@ -82,5 +95,26 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        if (::prefs.isInitialized) {
+            prefs.unregisterOnSharedPreferenceChangeListener(orientationListener)
+        }
+        super.onDestroy()
+    }
+
+    private fun applyOrientationPreference() {
+        val autoLandscape = prefs.getBoolean(KEY_AUTO_LANDSCAPE, true)
+        requestedOrientation = if (autoLandscape) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+    }
+
+    companion object {
+        const val PREFS_NAME = "concat_editor_prefs"
+        const val KEY_AUTO_LANDSCAPE = "auto_landscape"
     }
 }
