@@ -312,7 +312,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
             for ((clipId, style) in liveText) {
                 edits.withLock {
                     try {
-                        val existing = _ui.value.view?.clip(clipId) ?: continue@withLock
+                        val existing = _ui.value.view?.clip(clipId) ?: return@withLock
                         val lane = _ui.value.view?.tracks?.firstOrNull { it.id == existing.trackId }
                         val captions = lane?.captions
                         val view = if (lane != null && captions != null) {
