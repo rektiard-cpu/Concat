@@ -54,7 +54,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 data class CustomFont(
+    val label: String,
     val family: String,
+    val weight: Double = 400.0,
+    val italic: Boolean = false,
     val fileName: String,
     val path: String,
 )
@@ -320,6 +323,51 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
 
     private suspend fun apply(command: JSONObject) = api.apply(path, command)
 
+    /** Mengirim perintah teks dan otomatis menghapus field `fontPath` jika engine hanya menerima `fontFamily`. */
+    private suspend fun applyTextSafe(command: JSONObject): ProjectView {
+        return try {
+            apply(command)
+        } catch (error: Exception) {
+            val stripped = stripFontPathFromCommand(command)
+            if (stripped != null) apply(stripped) else throw error
+        }
+    }
+
+    private fun stripFontPathFromCommand(cmd: JSONObject): JSONObject? {
+        val copy = JSONObject(cmd.toString())
+        var changed = false
+        copy.optJSONObject("style")?.let { style ->
+            if (style.has("fontPath")) {
+                style.remove("fontPath")
+                changed = true
+            }
+        }
+        copy.optJSONObject("patch")?.optJSONObject("text")?.let { text ->
+            if (text.has("fontPath")) {
+                text.remove("fontPath")
+                changed = true
+            }
+        }
+        copy.optJSONArray("commands")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val sub = arr.optJSONObject(i) ?: continue
+                sub.optJSONObject("patch")?.optJSONObject("text")?.let { text ->
+                    if (text.has("fontPath")) {
+                        text.remove("fontPath")
+                        changed = true
+                    }
+                }
+                sub.optJSONObject("style")?.let { style ->
+                    if (style.has("fontPath")) {
+                        style.remove("fontPath")
+                        changed = true
+                    }
+                }
+            }
+        }
+        return if (changed) copy else null
+    }
+
     fun edit(label: String, body: suspend () -> ProjectView?) = change(label, body)
 
     fun move(clipId: String, start: Double, target: LaneTarget) {
@@ -404,9 +452,9 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                             val words = Commands.updateClip(existing.id, JSONObject().put("text", style))
                             val shared = JSONObject(style.toString()).put("content", "")
                             val look = JSONObject(captions.toString()).put("style", shared)
-                            apply(Commands.batch(listOf(words, Commands.setCaptionLook(lane.id, look))))
+                            applyTextSafe(Commands.batch(listOf(words, Commands.setCaptionLook(lane.id, look))))
                         } else {
-                            apply(Commands.updateClip(existing.id, JSONObject().put("text", style)))
+                            applyTextSafe(Commands.updateClip(existing.id, JSONObject().put("text", style)))
                         }
                         withContext(Dispatchers.IO) { preview?.refresh() }
                         _ui.update { it.copy(view = view) }
@@ -473,7 +521,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
             change("Duplicate") {
                 val baseText = clip.text?.optString("content")?.ifBlank { clip.name } ?: clip.name
                 val clonedStyle = JSONObject(clip.text?.toString() ?: "{}").put("content", baseText)
-                val afterAdd = apply(Commands.addTextClip(clip.start, clonedStyle, duration = clip.duration, trackId = null))
+                val afterAdd = applyTextSafe(Commands.addTextClip(clip.start, clonedStyle, duration = clip.duration, trackId = null))
                 val newId = afterAdd.createdId
                 val finalView = if (newId != null && (clip.scale != 1.0 || clip.offsetX != 0.0 || clip.offsetY != 0.0 || clip.rotation != 0.0)) {
                     apply(Commands.setClipTransform(newId, clip.scale, clip.offsetX, clip.offsetY, clip.rotation))
@@ -702,7 +750,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                 val words = Commands.updateClip(existing.id, JSONObject().put("text", cleanStyle))
                 val shared = JSONObject(cleanStyle.toString()).put("content", "")
                 val look = JSONObject(captions.toString()).put("style", shared)
-                apply(Commands.batch(listOf(words, Commands.setCaptionLook(lane.id, look))))
+                applyTextSafe(Commands.batch(listOf(words, Commands.setCaptionLook(lane.id, look))))
             } else if (existing != null && isImported && viewNow != null) {
                 val importedClips = viewNow.clips.filter { it.kind == ClipKind.Text && roles[it.id] == ROLE_IMPORTED }
                 val commands = importedClips.map { target ->
@@ -714,15 +762,15 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                     val targetStyle = JSONObject(cleanStyle.toString()).put("content", targetContent)
                     Commands.updateClip(target.id, JSONObject().put("text", targetStyle))
                 }
-                val result = apply(if (commands.size == 1) commands[0] else Commands.batch(commands))
+                val result = applyTextSafe(if (commands.size == 1) commands[0] else Commands.batch(commands))
                 if (importedClips.size > 1) {
                     say("Gaya diterapkan ke ${importedClips.size} subtitle impor.")
                 }
                 result
             } else if (existing != null) {
-                apply(Commands.updateClip(existing.id, JSONObject().put("text", cleanStyle)))
+                applyTextSafe(Commands.updateClip(existing.id, JSONObject().put("text", cleanStyle)))
             } else {
-                val view = apply(Commands.addTextClip(_ui.value.position, cleanStyle))
+                val view = applyTextSafe(Commands.addTextClip(_ui.value.position, cleanStyle))
                 view.createdId?.let { id -> _ui.update { it.copy(selected = id) } }
                 view
             }
@@ -736,6 +784,7 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         viewModelScope.launch {
             try {
                 val imported = withContext(Dispatchers.IO) {
+                    val filesDir = getApplication<Application>().filesDir
                     val resolver = getApplication<Application>().contentResolver
                     var rawName = "custom-font-${System.currentTimeMillis()}.ttf"
                     resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
@@ -745,17 +794,18 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
                     if (!lower.endsWith(".ttf") && !lower.endsWith(".otf") && !lower.endsWith(".ttc")) {
                         throw IOException("Pilih file font berformat .ttf atau .otf.")
                     }
-                    val fontsDir = File(getApplication<Application>().filesDir, "fonts").apply { mkdirs() }
+                    val fontsDir = File(filesDir, "fonts").apply { mkdirs() }
+                    val xdgFontsDir = File(filesDir, ".local/share/fonts").apply { mkdirs() }
                     val safeName = rawName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
                     val dest = File(fontsDir, safeName)
                     resolver.openInputStream(uri)?.use { input ->
                         dest.outputStream().use { output -> input.copyTo(output) }
                     } ?: throw IOException("Tidak dapat membuka file font.")
-                    val family = extractFontFamilyName(dest)
-                    CustomFont(family = family, fileName = dest.name, path = dest.absolutePath)
+                    dest.copyTo(File(xdgFontsDir, safeName), overwrite = true)
+                    parseCustomFont(dest)
                 }
                 _ui.update { it.copy(customFonts = scanCustomFonts()) }
-                say("Font \"${imported.family}\" berhasil ditambahkan.")
+                say("Font \"${imported.label}\" ditambahkan. Tutup & buka ulang aplikasi jika font baru belum tampil di preview.")
             } catch (error: Exception) {
                 Log.w(TAG, "import font failed", error)
                 say(error.message ?: "Gagal mengimpor font.")
@@ -788,68 +838,105 @@ class EditorViewModel(application: Application, val path: String) : AndroidViewM
         return dir.listFiles()
             ?.filter { it.isFile && (it.name.endsWith(".ttf", true) || it.name.endsWith(".otf", true) || it.name.endsWith(".ttc", true)) }
             ?.sortedBy { it.name.lowercase(Locale.ROOT) }
-            ?.map { file -> CustomFont(family = extractFontFamilyName(file), fileName = file.name, path = file.absolutePath) }
+            ?.map { file -> parseCustomFont(file) }
             .orEmpty()
     }
 
-    private fun extractFontFamilyName(file: File): String {
+    /**
+     * Membaca tabel OpenType `name` untuk mengekstrak:
+     * - Typographic Family (nameId=16, mis. "Satoshi" untuk fontdb Rust)
+     * - Subfamily / Style (nameId=17 / nameId=2, mis. "Black", "Bold", "Italic")
+     */
+    private fun parseCustomFont(file: File): CustomFont {
+        var typographicFamily: String? = null
+        var legacyFamily: String? = null
+        var subfamily: String? = null
         try {
             RandomAccessFile(file, "r").use { raf ->
-                if (raf.length() < 12) return file.nameWithoutExtension
-                raf.seek(4)
-                val numTables = raf.readUnsignedShort()
-                raf.skipBytes(6)
-                var nameOffset = -1L
-                for (i in 0 until numTables) {
-                    val tagBytes = ByteArray(4)
-                    raf.readFully(tagBytes)
-                    val tag = String(tagBytes, StandardCharsets.US_ASCII)
-                    raf.skipBytes(4)
-                    val offset = raf.readInt().toLong() and 0xFFFFFFFFL
-                    raf.skipBytes(4)
-                    if (tag == "name") {
-                        nameOffset = offset
-                        break
-                    }
-                }
-                if (nameOffset > 0 && nameOffset + 6 < raf.length()) {
-                    raf.seek(nameOffset + 2)
-                    val count = raf.readUnsignedShort()
-                    val stringOffset = raf.readUnsignedShort()
-                    var fallbackFamily: String? = null
-                    for (i in 0 until count) {
-                        val platformId = raf.readUnsignedShort()
-                        val encodingId = raf.readUnsignedShort()
-                        raf.skipBytes(2)
-                        val nameId = raf.readUnsignedShort()
-                        val length = raf.readUnsignedShort()
-                        val offset = raf.readUnsignedShort()
-                        if (nameId == 1 && length > 0) {
-                            val savedPos = raf.filePointer
-                            val strPos = nameOffset + stringOffset + offset
-                            if (strPos + length <= raf.length()) {
-                                raf.seek(strPos)
-                                val buf = ByteArray(length)
-                                raf.readFully(buf)
-                                val decoded = if (platformId == 3 || platformId == 0 || encodingId == 1) {
-                                    String(buf, StandardCharsets.UTF_16BE).trim()
-                                } else {
-                                    String(buf, StandardCharsets.UTF_8).trim()
-                                }
-                                if (decoded.isNotBlank()) {
-                                    if (platformId == 3) return decoded
-                                    if (fallbackFamily == null) fallbackFamily = decoded
-                                }
-                            }
-                            raf.seek(savedPos)
+                if (raf.length() >= 12) {
+                    raf.seek(4)
+                    val numTables = raf.readUnsignedShort()
+                    raf.skipBytes(6)
+                    var nameOffset = -1L
+                    for (i in 0 until numTables) {
+                        val tagBytes = ByteArray(4)
+                        raf.readFully(tagBytes)
+                        val tag = String(tagBytes, StandardCharsets.US_ASCII)
+                        raf.skipBytes(4)
+                        val offset = raf.readInt().toLong() and 0xFFFFFFFFL
+                        raf.skipBytes(4)
+                        if (tag == "name") {
+                            nameOffset = offset
+                            break
                         }
                     }
-                    if (!fallbackFamily.isNullOrBlank()) return fallbackFamily
+                    if (nameOffset > 0 && nameOffset + 6 < raf.length()) {
+                        raf.seek(nameOffset + 2)
+                        val count = raf.readUnsignedShort()
+                        val stringOffset = raf.readUnsignedShort()
+                        for (i in 0 until count) {
+                            val platformId = raf.readUnsignedShort()
+                            val encodingId = raf.readUnsignedShort()
+                            raf.skipBytes(2)
+                            val nameId = raf.readUnsignedShort()
+                            val length = raf.readUnsignedShort()
+                            val offset = raf.readUnsignedShort()
+                            if ((nameId == 16 || nameId == 1 || nameId == 17 || nameId == 2) && length > 0) {
+                                val savedPos = raf.filePointer
+                                val strPos = nameOffset + stringOffset + offset
+                                if (strPos + length <= raf.length()) {
+                                    raf.seek(strPos)
+                                    val buf = ByteArray(length)
+                                    raf.readFully(buf)
+                                    val decoded = if (platformId == 3 || platformId == 0 || encodingId == 1) {
+                                        String(buf, StandardCharsets.UTF_16BE).trim()
+                                    } else {
+                                        String(buf, StandardCharsets.UTF_8).trim()
+                                    }
+                                    if (decoded.isNotBlank()) {
+                                        when (nameId) {
+                                            16 -> if (platformId == 3 || typographicFamily == null) typographicFamily = decoded
+                                            1 -> if (platformId == 3 || legacyFamily == null) legacyFamily = decoded
+                                            17 -> if (platformId == 3 || subfamily == null) subfamily = decoded
+                                            2 -> if (subfamily == null) subfamily = decoded
+                                        }
+                                    }
+                                }
+                                raf.seek(savedPos)
+                            }
+                        }
+                    }
                 }
             }
         } catch (_: Exception) {
         }
-        return file.nameWithoutExtension
+
+        val resolvedFamily = (typographicFamily ?: legacyFamily ?: file.nameWithoutExtension).trim()
+        val hint = "${subfamily.orEmpty()} ${file.nameWithoutExtension}".lowercase(Locale.ROOT)
+        val weight = when {
+            "black" in hint || "heavy" in hint -> 900.0
+            "extrabold" in hint || "ultrabold" in hint -> 800.0
+            "bold" in hint -> 700.0
+            "semibold" in hint || "demibold" in hint -> 600.0
+            "medium" in hint -> 500.0
+            "light" in hint -> 300.0
+            "thin" in hint -> 200.0
+            else -> 400.0
+        }
+        val italic = "italic" in hint || "oblique" in hint
+        val displayLabel = if (!subfamily.isNullOrBlank() && !subfamily.equals("Regular", true) && !resolvedFamily.contains(subfamily, true)) {
+            "$resolvedFamily $subfamily"
+        } else {
+            legacyFamily ?: resolvedFamily
+        }
+        return CustomFont(
+            label = displayLabel,
+            family = resolvedFamily,
+            weight = weight,
+            italic = italic,
+            fileName = file.name,
+            path = file.absolutePath,
+        )
     }
 
     private fun loadSavedColors(): List<String> {
